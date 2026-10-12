@@ -1,0 +1,74 @@
+name: release
+
+# Tag a commit to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The installer and the portable exe are built and attached to a DRAFT release,
+# which you review and publish by hand from the Releases page.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+        timeout-minutes: 10
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=${{ steps.version.outputs.version }} installer\screenshot.iss
+          Copy-Item target\release\screenshot.exe "dist\Screenshot_${{ steps.version.outputs.version }}_x64-portable.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ steps.version.outputs.version }}
+          path: dist/*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 'Screenshot ${{ github.ref_name }}'
+          draft: true
+          files: dist/*
+          body: |
+            ## Which file do I download?
+
+            | You want | Download the file ending in |
+            |---|---|
+            | **Install it** (Start menu, starts with Windows) | **`_x64-setup.exe`** |
+            | **No install**, just run it | **`_x64-portable.exe`** |
+
+            Windows 10 or 11, 64-bit.
+
+            ### "Windows protected your PC"?
+
+            The app is free and not code-signed, so Windows warns once. Click **More info**, then **Run anyway**.

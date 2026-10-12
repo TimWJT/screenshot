@@ -1,0 +1,426 @@
+//! Saved preferences and the Settings window.
+
+use std::cell::RefCell;
+use std::path::PathBuf;
+
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Registry::*;
+use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::util::{config_dir, default_save_dir, hinstance, pcwstr, wide};
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// MOD_ALT / MOD_CONTROL / MOD_SHIFT / MOD_WIN bits.
+    pub hotkey_mods: u32,
+    /// Virtual-key code; 0 means no custom shortcut.
+    pub hotkey_vk: u32,
+    pub printscreen: bool,
+    pub save_dir: String,
+    pub autosave: bool,
+    pub color: u32,
+    pub size: f32,
+    pub fill: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            hotkey_mods: MOD_ALT.0,
+            hotkey_vk: VK_F1.0 as u32,
+            printscreen: true,
+            save_dir: String::new(),
+            autosave: false,
+            color: 0xe53935,
+            size: 3.0,
+            fill: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn save_path(&self) -> PathBuf {
+        if self.save_dir.trim().is_empty() {
+            default_save_dir()
+        } else {
+            PathBuf::from(&self.save_dir)
+        }
+    }
+}
+
+thread_local! {
+    static CONFIG: RefCell<Config> = RefCell::new(Config::default());
+    static WINDOW: RefCell<Option<SettingsWindow>> = const { RefCell::new(None) };
+}
+
+fn file() -> PathBuf {
+    config_dir().join("settings.ini")
+}
+
+/// Load settings. Returns false when there was no settings file yet (first run).
+pub fn load() -> bool {
+    let Ok(text) = std::fs::read_to_string(file()) else { return false };
+    let mut c = Config::default();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim();
+        let num = || v.parse::<u32>().ok();
+        let flag = v == "1" || v.eq_ignore_ascii_case("true");
+        match k.trim() {
+            "hotkey_mods" => c.hotkey_mods = num().unwrap_or(c.hotkey_mods),
+            "hotkey_vk" => c.hotkey_vk = num().unwrap_or(c.hotkey_vk),
+            "printscreen" => c.printscreen = flag,
+            "save_dir" => c.save_dir = v.to_string(),
+            "autosave" => c.autosave = flag,
+            "color" => c.color = u32::from_str_radix(v.trim_start_matches('#'), 16).unwrap_or(c.color),
+            "size" => c.size = v.parse::<f32>().unwrap_or(c.size).clamp(1.0, 40.0),
+            "fill" => c.fill = flag,
+            _ => {}
+        }
+    }
+    CONFIG.with(|cfg| *cfg.borrow_mut() = c);
+    true
+}
+
+fn save() {
+    let c = get();
+    let text = format!(
+        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\n",
+        c.hotkey_mods, c.hotkey_vk, c.printscreen as u8, c.save_dir, c.autosave as u8, c.color, c.size, c.fill as u8
+    );
+    let _ = std::fs::create_dir_all(config_dir());
+    let _ = std::fs::write(file(), text);
+}
+
+pub fn get() -> Config {
+    CONFIG.with(|c| c.borrow().clone())
+}
+
+/// Change settings and write them out. Re-reads the file first, because the capture process
+/// and the tray process both write to it.
+pub fn update(f: impl FnOnce(&mut Config)) {
+    load();
+    CONFIG.with(|c| f(&mut c.borrow_mut()));
+    save();
+}
+
+/// "Ctrl+Shift+S", "Alt+F1", "Print Screen".
+pub fn hotkey_name(mods: u32, vk: u32) -> String {
+    let mut s = String::new();
+    for (bit, name) in [(MOD_CONTROL.0, "Ctrl+"), (MOD_ALT.0, "Alt+"), (MOD_SHIFT.0, "Shift+"), (MOD_WIN.0, "Win+")] {
+        if mods & bit != 0 {
+            s.push_str(name);
+        }
+    }
+    let key = match vk {
+        0x70..=0x87 => format!("F{}", vk - 0x6f),
+        0x30..=0x39 | 0x41..=0x5a => char::from_u32(vk).unwrap().to_string(),
+        0x2c => "Print Screen".into(),
+        _ => unsafe {
+            let ext = matches!(vk, 0x21..=0x2e) as i32; // navigation keys live on the extended scan codes
+            let sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) as i32;
+            let mut buf = [0u16; 64];
+            let n = GetKeyNameTextW((sc << 16) | (ext << 24), &mut buf);
+            if n > 0 {
+                String::from_utf16_lossy(&buf[..n as usize])
+            } else {
+                format!("Key {vk}")
+            }
+        },
+    };
+    s + &key
+}
+
+// ---- start with Windows ------------------------------------------------------------------
+
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("Screenshot");
+
+pub fn autostart_enabled() -> bool {
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None).is_ok() }
+}
+
+pub fn set_autostart(on: bool) {
+    unsafe {
+        if on {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let cmd = wide(&format!("\"{}\" --tray", exe.display()));
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                RUN_KEY,
+                RUN_VALUE,
+                REG_SZ.0,
+                Some(cmd.as_ptr() as *const _),
+                (cmd.len() * 2) as u32,
+            );
+        } else {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+        }
+    }
+}
+
+// ---- window ------------------------------------------------------------------------------
+
+const ID_HOTKEY: i32 = 101;
+const ID_PRTSC: i32 = 102;
+const ID_STARTUP: i32 = 103;
+const ID_DIR: i32 = 104;
+const ID_BROWSE: i32 = 105;
+const ID_AUTOSAVE: i32 = 106;
+const ID_LINK: i32 = 107;
+const ID_OK: i32 = 1;
+const ID_CANCEL: i32 = 2;
+
+const HKM_SETHOTKEY: u32 = WM_USER + 1;
+const HKM_GETHOTKEY: u32 = WM_USER + 2;
+const HOTKEYF_SHIFT: u32 = 0x1;
+const HOTKEYF_CONTROL: u32 = 0x2;
+const HOTKEYF_ALT: u32 = 0x4;
+
+struct SettingsWindow {
+    hwnd: HWND,
+    font: HFONT,
+}
+
+pub fn window() -> Option<HWND> {
+    WINDOW.with(|w| w.try_borrow().ok().and_then(|w| w.as_ref().map(|s| s.hwnd)))
+}
+
+pub fn show() {
+    if let Some(h) = window() {
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOWNORMAL);
+            crate::util::force_foreground(h);
+        }
+        return;
+    }
+    unsafe {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        let class = w!("TimWJT.Screenshot.Settings");
+        REGISTERED.call_once(|| {
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinstance(),
+                hIcon: LoadIconW(Some(hinstance()), PCWSTR(1 as _)).unwrap_or_default(),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+        });
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let Ok(hwnd) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class,
+            w!("Screenshot Settings"),
+            style,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            400,
+            300,
+            None,
+            None,
+            Some(hinstance()),
+            None,
+        ) else {
+            return;
+        };
+        build(hwnd, style);
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        crate::util::force_foreground(hwnd);
+    }
+}
+
+unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let px = |v: i32| v * dpi as i32 / 96;
+
+    let mut ncm = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+    let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, ncm.cbSize, Some(&mut ncm as *mut _ as *mut _), 0, dpi);
+    let font = CreateFontIndirectW(&ncm.lfMessageFont);
+
+    let child = |class: PCWSTR, text: &str, style: u32, id: i32, x: i32, y: i32, w: i32, h: i32| -> HWND {
+        let t = wide(text);
+        let h = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class,
+            pcwstr(&t),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
+            px(x),
+            px(y),
+            px(w),
+            px(h),
+            Some(hwnd),
+            Some(HMENU(id as isize as *mut _)),
+            Some(hinstance()),
+            None,
+        )
+        .unwrap_or_default();
+        SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        h
+    };
+
+    let cfg = get();
+    let tab = WS_TABSTOP.0;
+    let check = BS_AUTOCHECKBOX as u32 | tab;
+    child(w!("STATIC"), "Capture shortcut", 0, -1, 16, 19, 130, 20);
+    let hk = child(w!("msctls_hotkey32"), "", tab | WS_BORDER.0, ID_HOTKEY, 150, 16, 274, 24);
+    child(w!("STATIC"), "Click the box, then press the keys you want.", 0, -1, 150, 44, 290, 18);
+    let prtsc = child(w!("BUTTON"), "Print Screen key also captures", check, ID_PRTSC, 16, 70, 400, 22);
+    let startup = child(w!("BUTTON"), "Start with Windows (stays in the tray)", check, ID_STARTUP, 16, 96, 400, 22);
+    child(w!("STATIC"), "Save folder", 0, -1, 16, 134, 130, 20);
+    let dir = child(w!("EDIT"), &cfg.save_path().to_string_lossy(), ES_AUTOHSCROLL as u32 | tab | WS_BORDER.0, ID_DIR, 16, 156, 316, 24);
+    child(w!("BUTTON"), "Browse…", BS_PUSHBUTTON as u32 | tab, ID_BROWSE, 340, 155, 84, 26);
+    let auto = child(w!("BUTTON"), "Also save every copied screenshot to this folder", check, ID_AUTOSAVE, 16, 188, 400, 22);
+    child(
+        WC_LINK,
+        &format!("Screenshot {} by Tim  ·  <a href=\"https://github.com/TimWJT/screenshot\">GitHub</a>", env!("CARGO_PKG_VERSION")),
+        tab,
+        ID_LINK,
+        16,
+        234,
+        230,
+        20,
+    );
+    child(w!("BUTTON"), "Save", BS_DEFPUSHBUTTON as u32 | tab, ID_OK, 252, 228, 84, 28);
+    child(w!("BUTTON"), "Cancel", BS_PUSHBUTTON as u32 | tab, ID_CANCEL, 340, 228, 84, 28);
+
+    let mut flags = 0;
+    if cfg.hotkey_mods & MOD_SHIFT.0 != 0 {
+        flags |= HOTKEYF_SHIFT;
+    }
+    if cfg.hotkey_mods & MOD_CONTROL.0 != 0 {
+        flags |= HOTKEYF_CONTROL;
+    }
+    if cfg.hotkey_mods & MOD_ALT.0 != 0 {
+        flags |= HOTKEYF_ALT;
+    }
+    SendMessageW(hk, HKM_SETHOTKEY, Some(WPARAM(((flags << 8) | cfg.hotkey_vk) as usize)), None);
+    let set = |h: HWND, on: bool| {
+        SendMessageW(h, BM_SETCHECK, Some(WPARAM(if on { 1 } else { 0 })), None);
+    };
+    set(prtsc, cfg.printscreen);
+    set(startup, autostart_enabled());
+    set(auto, cfg.autosave);
+    let _ = dir;
+
+    // Size the window around a 440×270 client area and centre it on the primary monitor.
+    let mut r = RECT { left: 0, top: 0, right: px(440), bottom: px(270) };
+    let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE::default(), dpi);
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let mut work = RECT::default();
+    let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    let x = work.left + (work.right - work.left - w) / 2;
+    let y = work.top + (work.bottom - work.top - h) / 2;
+    let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER);
+
+    WINDOW.with(|wnd| *wnd.borrow_mut() = Some(SettingsWindow { hwnd, font }));
+    let _ = SetFocus(Some(hk));
+}
+
+unsafe fn item(hwnd: HWND, id: i32) -> HWND {
+    GetDlgItem(Some(hwnd), id).unwrap_or_default()
+}
+
+unsafe fn checked(hwnd: HWND, id: i32) -> bool {
+    SendMessageW(item(hwnd, id), BM_GETCHECK, None, None).0 == 1
+}
+
+unsafe fn apply(hwnd: HWND) {
+    let hk = SendMessageW(item(hwnd, ID_HOTKEY), HKM_GETHOTKEY, None, None).0 as u32;
+    let vk = hk & 0xff;
+    let flags = (hk >> 8) & 0xff;
+    let mut mods = 0;
+    if flags & HOTKEYF_SHIFT != 0 {
+        mods |= MOD_SHIFT.0;
+    }
+    if flags & HOTKEYF_CONTROL != 0 {
+        mods |= MOD_CONTROL.0;
+    }
+    if flags & HOTKEYF_ALT != 0 {
+        mods |= MOD_ALT.0;
+    }
+    let mut buf = [0u16; 1024];
+    let n = GetWindowTextW(item(hwnd, ID_DIR), &mut buf);
+    let mut dir = String::from_utf16_lossy(&buf[..n as usize]).trim().to_string();
+    if PathBuf::from(&dir) == default_save_dir() {
+        dir.clear();
+    }
+    let prtsc = checked(hwnd, ID_PRTSC);
+    let auto = checked(hwnd, ID_AUTOSAVE);
+    update(|c| {
+        c.hotkey_mods = mods;
+        c.hotkey_vk = vk;
+        c.printscreen = prtsc;
+        c.save_dir = dir;
+        c.autosave = auto;
+    });
+    set_autostart(checked(hwnd, ID_STARTUP));
+    crate::apply_hotkeys();
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = (wp.0 & 0xffff) as i32;
+            match id {
+                ID_OK => {
+                    apply(hwnd);
+                    let _ = DestroyWindow(hwnd);
+                }
+                ID_CANCEL => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                ID_BROWSE => {
+                    let mut buf = [0u16; 1024];
+                    let n = GetWindowTextW(item(hwnd, ID_DIR), &mut buf);
+                    let cur = PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
+                    if let Some(p) = crate::dialogs::pick_folder(hwnd, &cur) {
+                        let t = wide(&p);
+                        let _ = SetWindowTextW(item(hwnd, ID_DIR), pcwstr(&t));
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_NOTIFY => {
+            let hdr = &*(lp.0 as *const NMHDR);
+            if hdr.idFrom == ID_LINK as usize && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
+                let link = &*(lp.0 as *const NMLINK);
+                let url = crate::util::from_wide(&link.item.szUrl);
+                let u = wide(&url);
+                ShellExecuteW(None, w!("open"), pcwstr(&u), None, None, SW_SHOWNORMAL);
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC => {
+            let dc = HDC(wp.0 as *mut _);
+            SetBkMode(dc, TRANSPARENT);
+            let id = GetDlgCtrlID(HWND(lp.0 as *mut _));
+            if id == -1 || id == 0xffff {
+                SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+            }
+            LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if let Some(w) = WINDOW.with(|w| w.borrow_mut().take()) {
+                let _ = DeleteObject(w.font.into());
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
