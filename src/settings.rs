@@ -1,7 +1,7 @@
 //! Saved preferences and the Settings window.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -66,6 +66,12 @@ fn file() -> PathBuf {
 /// Load settings. Returns false when there was no settings file yet (first run).
 pub fn load() -> bool {
     let Ok(text) = std::fs::read_to_string(file()) else { return false };
+    let c = parse(&text);
+    CONFIG.with(|cfg| *cfg.borrow_mut() = c);
+    true
+}
+
+fn parse(text: &str) -> Config {
     let mut c = Config::default();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
@@ -84,18 +90,29 @@ pub fn load() -> bool {
             _ => {}
         }
     }
-    CONFIG.with(|cfg| *cfg.borrow_mut() = c);
-    true
+    c
+}
+
+fn format(c: &Config) -> String {
+    format!(
+        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\n",
+        c.hotkey_mods, c.hotkey_vk, c.printscreen as u8, c.save_dir, c.autosave as u8, c.color, c.size, c.fill as u8
+    )
 }
 
 fn save() {
-    let c = get();
-    let text = format!(
-        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\n",
-        c.hotkey_mods, c.hotkey_vk, c.printscreen as u8, c.save_dir, c.autosave as u8, c.color, c.size, c.fill as u8
-    );
     let _ = std::fs::create_dir_all(config_dir());
-    let _ = std::fs::write(file(), text);
+    // Write a temp file and swap it in, so the other process never reads a half-written file.
+    let tmp = config_dir().join(format!("settings.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format(&get())).is_ok() && std::fs::rename(&tmp, file()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Is this usable as a global shortcut? A key with no Ctrl, Alt or Win would fire on normal
+/// typing, so on its own only a function key, Pause, Scroll Lock or Print Screen will do.
+pub fn valid_shortcut(mods: u32, vk: u32) -> bool {
+    mods & (MOD_CONTROL.0 | MOD_ALT.0 | MOD_WIN.0) != 0 || matches!(vk, 0x70..=0x87 | 0x13 | 0x91 | 0x2c)
 }
 
 pub fn get() -> Config {
@@ -334,7 +351,8 @@ unsafe fn checked(hwnd: HWND, id: i32) -> bool {
     SendMessageW(item(hwnd, id), BM_GETCHECK, None, None).0 == 1
 }
 
-unsafe fn apply(hwnd: HWND) {
+/// Save what's in the window. False, after telling the user why, when something needs fixing.
+unsafe fn apply(hwnd: HWND) -> bool {
     let hk = SendMessageW(item(hwnd, ID_HOTKEY), HKM_GETHOTKEY, None, None).0 as u32;
     let vk = hk & 0xff;
     let flags = (hk >> 8) & 0xff;
@@ -351,8 +369,19 @@ unsafe fn apply(hwnd: HWND) {
     let mut buf = [0u16; 1024];
     let n = GetWindowTextW(item(hwnd, ID_DIR), &mut buf);
     let mut dir = String::from_utf16_lossy(&buf[..n as usize]).trim().to_string();
-    if PathBuf::from(&dir) == default_save_dir() {
+    if Path::new(&dir) == default_save_dir() {
         dir.clear();
+    }
+    if vk != 0 && !valid_shortcut(mods, vk) {
+        crate::error_box(hwnd, "Pick a shortcut with Ctrl or Alt in it, or a function key such as F9.\n\nA key on its own would start a capture every time you typed it.");
+        let _ = SetFocus(Some(item(hwnd, ID_HOTKEY)));
+        return false;
+    }
+    // A relative folder would depend on where the app was started from (System32, at sign-in).
+    if !dir.is_empty() && !Path::new(&dir).is_absolute() {
+        crate::error_box(hwnd, "The save folder needs to be a full path, such as C:\\Users\\you\\Pictures\\Screenshots.");
+        let _ = SetFocus(Some(item(hwnd, ID_DIR)));
+        return false;
     }
     let prtsc = checked(hwnd, ID_PRTSC);
     let auto = checked(hwnd, ID_AUTOSAVE);
@@ -365,6 +394,7 @@ unsafe fn apply(hwnd: HWND) {
     });
     set_autostart(checked(hwnd, ID_STARTUP));
     crate::apply_hotkeys();
+    true
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -373,8 +403,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let id = (wp.0 & 0xffff) as i32;
             match id {
                 ID_OK => {
-                    apply(hwnd);
-                    let _ = DestroyWindow(hwnd);
+                    if apply(hwnd) {
+                        let _ = DestroyWindow(hwnd);
+                    }
                 }
                 ID_CANCEL => {
                     let _ = DestroyWindow(hwnd);
@@ -411,6 +442,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
         }
+        // While Settings is in front, pressing the current shortcut should record it in the
+        // shortcut box, not start a capture.
+        WM_ACTIVATE => {
+            if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
+                crate::apply_hotkeys();
+            } else {
+                crate::suspend_hotkeys();
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -419,8 +460,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Some(w) = WINDOW.with(|w| w.borrow_mut().take()) {
                 let _ = DeleteObject(w.font.into());
             }
+            crate::apply_hotkeys();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_round_trip() {
+        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true };
+        let back = parse(&format(&c));
+        assert_eq!(format(&back), format(&c));
+    }
+
+    #[test]
+    fn bad_values_fall_back() {
+        let c = parse("hotkey_vk=abc\ncolor=#zzzzzz\nsize=999\nnonsense\nunknown=1\n");
+        let d = Config::default();
+        assert_eq!((c.hotkey_vk, c.color, c.size), (d.hotkey_vk, d.color, 40.0));
+        assert_eq!(parse("").hotkey_mods, d.hotkey_mods);
+    }
+
+    #[test]
+    fn shortcuts_need_a_modifier_unless_special() {
+        assert!(valid_shortcut(MOD_ALT.0, VK_F1.0 as u32));
+        assert!(valid_shortcut(MOD_CONTROL.0, 0x41));
+        assert!(valid_shortcut(0, VK_F9.0 as u32));
+        assert!(valid_shortcut(0, VK_SNAPSHOT.0 as u32));
+        assert!(!valid_shortcut(0, 0x41), "a bare letter would fire while typing");
+        assert!(!valid_shortcut(MOD_SHIFT.0, 0x41), "Shift+letter is just a capital");
+        assert!(!valid_shortcut(0, VK_SPACE.0 as u32));
+    }
+
+    #[test]
+    fn names_shortcuts() {
+        assert_eq!(hotkey_name(MOD_ALT.0, VK_F1.0 as u32), "Alt+F1");
+        assert_eq!(hotkey_name(MOD_CONTROL.0 | MOD_SHIFT.0, 0x53), "Ctrl+Shift+S");
+        assert_eq!(hotkey_name(0, 0x2c), "Print Screen");
     }
 }

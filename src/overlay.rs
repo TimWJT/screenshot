@@ -60,7 +60,7 @@ impl Btn {
             Btn::Undo => "Undo (Ctrl+Z)".into(),
             Btn::Redo => "Redo (Ctrl+Y)".into(),
             Btn::Pin => "Pin to screen (Ctrl+P)".into(),
-            Btn::Save => "Save as… (Ctrl+S)".into(),
+            Btn::Save => "Save (Ctrl+S)".into(),
             Btn::Copy => "Copy and close (Enter)".into(),
             Btn::Close => "Cancel (Esc)".into(),
             Btn::Size(i) => SIZES[i].1.into(),
@@ -115,10 +115,15 @@ enum Drag {
     Button(Btn),
 }
 
+#[derive(Default)]
 enum Act {
+    #[default]
     None,
     Copy,
+    /// Straight into the save folder.
     Save,
+    /// Through the Save As dialog.
+    SaveAs,
     Pin,
     Close,
     PickColor,
@@ -140,7 +145,8 @@ struct Bars {
 struct Overlay {
     hwnd: HWND,
     rt: Option<ID2D1HwndRenderTarget>,
-    bmp: Option<ID2D1Bitmap>,
+    /// The screenshot, uploaded to `rt`.
+    tiles: gfx::Tiles,
     shot: Shot,
     wins: Vec<Rc>,
     mons: Vec<(Rc, f32)>,
@@ -165,6 +171,7 @@ struct Overlay {
 
 thread_local! {
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
+    static HIGH_SURROGATE: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 
 pub const CLASS: PCWSTR = w!("TimWJT.Screenshot.Overlay");
@@ -179,12 +186,6 @@ fn with<R: Default>(f: impl FnOnce(&mut Overlay) -> R) -> R {
         Ok(mut o) => o.as_mut().map(f).unwrap_or_default(),
         Err(_) => R::default(),
     })
-}
-
-impl Default for Act {
-    fn default() -> Self {
-        Act::None
-    }
 }
 
 pub fn open(shot: Shot, full: bool) {
@@ -236,7 +237,7 @@ pub fn open(shot: Shot, full: bool) {
         let mut o = Overlay {
             hwnd,
             rt: None,
-            bmp: None,
+            tiles: Vec::new(),
             shot,
             wins,
             mons,
@@ -293,13 +294,28 @@ fn run(act: Act) {
         Act::None => {}
         Act::Close => close(),
         Act::Copy => {
-            if let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) {
-                gfx::copy_image(hwnd, &img);
-                crate::autosave(&img);
-                close();
+            let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) else { return };
+            if !gfx::copy_image(hwnd, &img) {
+                // Keep the editor open so the capture isn't lost.
+                crate::error_box(hwnd, "Could not copy to the clipboard. Another app may be using it; try again.");
+                return;
             }
+            close();
+            // After closing, so a "could not save" message isn't hidden behind the editor.
+            crate::autosave(&img);
         }
         Act::Save => {
+            let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) else { return };
+            match crate::save_to_folder(&img) {
+                Ok(path) => {
+                    close();
+                    crate::notify_saved(&path);
+                }
+                // Keep the editor open so the capture isn't lost.
+                Err(msg) => crate::error_box(hwnd, &msg),
+            }
+        }
+        Act::SaveAs => {
             let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) else { return };
             let cfg = settings::get();
             if let Some(path) = dialogs::save_as(hwnd, &cfg.save_path(), &crate::util::timestamp_name()) {
@@ -384,9 +400,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Swallow Alt on its own so it does not enter menu mode on a window with no menu.
         WM_SYSKEYUP | WM_SYSCHAR => return LRESULT(0),
         WM_CHAR => {
-            if let Some(c) = char::from_u32(wp.0 as u32) {
+            // Characters beyond U+FFFF (emoji) arrive as two WM_CHARs, one per surrogate.
+            let unit = wp.0 as u16;
+            let c = HIGH_SURROGATE.with(|high| match unit {
+                0xd800..=0xdbff => {
+                    high.set(unit);
+                    None
+                }
+                0xdc00..=0xdfff => char::decode_utf16([high.replace(0), unit]).next()?.ok(),
+                _ => char::from_u32(unit as u32),
+            });
+            if let Some(c) = c {
                 with(|o| o.on_char(c));
             }
+            Act::None
+        }
+        // Lost the mouse mid-drag (Alt+Tab, a dialog, Ctrl+Alt+Del): drop the drag.
+        WM_CAPTURECHANGED => {
+            with(|o| {
+                if HWND(lp.0 as *mut _) != o.hwnd {
+                    o.cancel_drag();
+                }
+            });
             Act::None
         }
         // The window spans every monitor on purpose; ignore the size Windows suggests.
@@ -824,7 +859,7 @@ impl Overlay {
                     match a.tool {
                         Tool::Pen | Tool::Marker => {
                             let last = *a.pts.last().unwrap();
-                            if shift && a.pts.len() >= 1 {
+                            if shift {
                                 // Shift draws a straight stroke from where it began.
                                 a.pts.truncate(1);
                                 a.pts.push(p);
@@ -904,9 +939,7 @@ impl Overlay {
             unsafe {
                 let _ = ReleaseCapture();
             }
-            self.drag = Drag::None;
-            self.current = None;
-            self.redraw();
+            self.cancel_drag();
             return Act::None;
         }
         match self.region {
@@ -921,6 +954,17 @@ impl Overlay {
             }
             Some(_) => Act::None,
         }
+    }
+
+    fn cancel_drag(&mut self) {
+        if matches!(self.drag, Drag::None) {
+            return;
+        }
+        if matches!(self.drag, Drag::Draw) {
+            self.current = None;
+        }
+        self.drag = Drag::None;
+        self.redraw();
     }
 
     fn on_wheel(&mut self, delta: i16) {
@@ -980,6 +1024,7 @@ impl Overlay {
         if ctrl {
             match vk {
                 VK_C => return Act::Copy,
+                VK_S if shift => return Act::SaveAs,
                 VK_S => return Act::Save,
                 VK_P => return Act::Pin,
                 VK_Z if shift => self.redo(),
@@ -1073,9 +1118,7 @@ impl Overlay {
         let img = &self.shot.img;
         let annots = &self.annots;
         gfx::render_image(r.w() as u32, r.h() as u32, |rt| unsafe {
-            if let Some(bmp) = gfx::bitmap_of(rt, img, r.l as u32, r.t as u32, r.w() as u32, r.h() as u32) {
-                rt.DrawBitmap(&bmp, Some(&rf(0.0, 0.0, r.w() as f32, r.h() as f32)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
-            }
+            gfx::draw_tiles(rt, &gfx::tiles_of(rt, img, r.l as u32, r.t as u32, r.w() as u32, r.h() as u32));
             rt.SetTransform(&Matrix3x2::translation(-r.l as f32, -r.t as f32));
             for a in annots {
                 a.draw(rt, img);
@@ -1095,9 +1138,20 @@ impl Overlay {
             pixelSize: D2D_SIZE_U { width: self.shot.img.w, height: self.shot.img.h },
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
-        let rt = gfx::with(|g| unsafe { g.d2d.CreateHwndRenderTarget(&props, &hp) }).ok()?;
+        let side = self.shot.img.w.max(self.shot.img.h);
+        let rt = gfx::with(|g| unsafe {
+            // A desktop wider than the GPU allows can't have a hardware target; use software then.
+            g.d2d
+                .CreateHwndRenderTarget(&props, &hp)
+                .ok()
+                .filter(|rt| rt.GetMaximumBitmapSize() >= side)
+                .or_else(|| {
+                    let soft = D2D1_RENDER_TARGET_PROPERTIES { r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE, ..props };
+                    g.d2d.CreateHwndRenderTarget(&soft, &hp).ok()
+                })
+        })?;
         let img = &self.shot.img;
-        self.bmp = gfx::bitmap_of(&rt, img, 0, 0, img.w, img.h);
+        self.tiles = gfx::tiles_of(&rt, img, 0, 0, img.w, img.h);
         self.rt = Some(rt);
         Some(())
     }
@@ -1110,14 +1164,12 @@ impl Overlay {
         unsafe {
             rt.BeginDraw();
             rt.SetTransform(&Matrix3x2::identity());
-            if let Some(bmp) = &self.bmp {
-                rt.DrawBitmap(bmp, None, 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
-            }
+            gfx::draw_tiles(&rt, &self.tiles);
             self.paint_scene(&rt);
             if let Err(e) = rt.EndDraw(None, None) {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.rt = None;
-                    self.bmp = None;
+                    self.tiles.clear();
                     self.redraw();
                 }
             }
@@ -1215,8 +1267,9 @@ impl Overlay {
     unsafe fn size_label(&self, rt: &ID2D1RenderTarget, r: Rc, s: f32) {
         let text = format!("{} × {}", r.w(), r.h());
         let lh = 22.0 * s;
-        let y = if r.t as f32 - lh - 6.0 * s >= self.monitor_at(r.l, r.t).0.t as f32 { r.t as f32 - lh - 6.0 * s } else { r.t as f32 + 6.0 * s };
-        let x = if r.t as f32 - lh - 6.0 * s >= 0.0 { r.l as f32 } else { r.l as f32 + 6.0 * s };
+        // Above the selection when it fits on that monitor, otherwise just inside its corner.
+        let above = r.t as f32 - lh - 6.0 * s >= self.monitor_at(r.l, r.t).0.t as f32;
+        let (x, y) = if above { (r.l as f32, r.t as f32 - lh - 6.0 * s) } else { (r.l as f32 + 6.0 * s, r.t as f32 + 6.0 * s) };
         self.label(rt, &text, x, y, s);
     }
 
@@ -1409,7 +1462,6 @@ impl Overlay {
     }
 
     unsafe fn magnifier(&self, rt: &ID2D1RenderTarget, s: f32) {
-        let Some(bmp) = &self.bmp else { return };
         let (mx, my) = (self.mx, self.my);
         let cells = 15;
         let cell = (8.0 * s).round();
@@ -1436,7 +1488,10 @@ impl Overlay {
                 x + (vis.r - src.l) as f32 * cell,
                 y + (vis.b - src.t) as f32 * cell,
             );
-            rt.DrawBitmap(bmp, Some(&d), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&vis.f()));
+            // Just the few pixels around the cursor, so it doesn't depend on how the screenshot is tiled.
+            if let Some(bmp) = gfx::bitmap_of(rt, &self.shot.img, vis.l as u32, vis.t as u32, vis.w() as u32, vis.h() as u32) {
+                rt.DrawBitmap(&bmp, Some(&d), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
+            }
         }
         let cross = brush(rt, ACCENT, 0.35);
         let c0 = half as f32 * cell;
@@ -1513,7 +1568,7 @@ mod tests {
         let mut o = Overlay {
             hwnd: HWND::default(),
             rt: None,
-            bmp: None,
+            tiles: vec![],
             shot,
             wins: vec![],
             mons,
@@ -1535,7 +1590,7 @@ mod tests {
             selected: None,
             hot: Some(Btn::Tool(Tool::Arrow)),
         };
-        let mk = |t: Tool, c: u32, pts: Vec<[f32; 2]>, text: &str| Annot { tool: t, color: c, size: 6.0, fill: false, scale: 1.5, pts, text: text.into() };
+        let mk = |t: Tool, c: u32, pts: Vec<[f32; 2]>, text: &str| Annot { tool: t, color: c, size: 6.0, fill: false, scale: 1.5, pts, text: text.into(), pixels: Default::default() };
         o.annots = vec![
             mk(Tool::Rect, 0xe53935, vec![[450.0, 300.0], [800.0, 500.0]], ""),
             mk(Tool::Ellipse, 0x43a047, vec![[850.0, 300.0], [1150.0, 500.0]], ""),
@@ -1554,8 +1609,8 @@ mod tests {
 
         let render = |o: &mut Overlay, name: &str| {
             let img = gfx::render_image(w, h, |rt| unsafe {
-                o.bmp = gfx::bitmap_of(rt, &o.shot.img, 0, 0, w, h);
-                rt.DrawBitmap(o.bmp.as_ref().unwrap(), None, 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
+                o.tiles = gfx::tiles_of(rt, &o.shot.img, 0, 0, w, h);
+                gfx::draw_tiles(rt, &o.tiles);
                 o.paint_scene(rt);
             })
             .unwrap();
@@ -1572,6 +1627,26 @@ mod tests {
         o.hover = Some(Rc { l: 300, t: 200, r: 1700, b: 1000 });
         o.hot = None;
         render(&mut o, "scene-pick");
+    }
+
+    /// An image wider than any GPU texture still comes out whole, via tiles.
+    #[test]
+    fn tiles_cover_wide_images() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let (w, h) = (20_000u32, 40u32);
+        let mut px = vec![255u8; (w * h * 4) as usize];
+        for x in 0..w {
+            for y in 0..h {
+                px[((y * w + x) * 4) as usize] = (x % 251) as u8;
+            }
+        }
+        let img = Image { w, h, px };
+        let out = gfx::render_image(w, h, |rt| gfx::draw_tiles(rt, &gfx::tiles_of(rt, &img, 0, 0, w, h))).unwrap();
+        for x in [0, 16_383, 16_384, 19_999] {
+            assert_eq!(out.pixel(x, 20), img.pixel(x, 20), "pixel at x = {x}");
+        }
     }
 }
 

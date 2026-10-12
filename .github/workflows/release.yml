@@ -17,11 +17,12 @@ jobs:
       contents: write
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a commit, so a moved tag can't change what runs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Test
         run: cargo test --release
@@ -34,7 +35,18 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
+          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          # The version lives in three files; refuse to release if they or the tag disagree.
+          rc="$(grep -m1 '"ProductVersion"' assets/app.rc | cut -d'"' -f4)"
+          manifest="$(grep -m1 'assemblyIdentity type="win32" name="TimWJT' assets/app.manifest | sed -E 's/.*version="([0-9.]+)".*/\1/')"
+          fail=0
+          [[ "$rc" == "$v" ]] || { echo "::error::assets/app.rc says $rc, Cargo.toml says $v"; fail=1; }
+          [[ "$manifest" == "$v.0" ]] || { echo "::error::assets/app.manifest says $manifest, Cargo.toml says $v"; fail=1; }
+          grep -q "FILEVERSION ${v//./,},0" assets/app.rc || { echo "::error::FILEVERSION in assets/app.rc is not ${v//./,},0"; fail=1; }
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$v" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; fail=1
+          fi
+          [[ $fail == 0 ]] || exit 1
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Installer
@@ -47,12 +59,12 @@ jobs:
           iscc /DAppVersion=${{ steps.version.outputs.version }} installer\screenshot.iss
           Copy-Item target\release\screenshot.exe "dist\Screenshot_${{ steps.version.outputs.version }}_x64-portable.exe"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: screenshot-${{ steps.version.outputs.version }}
           path: dist/*
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ${{ github.ref_name }}

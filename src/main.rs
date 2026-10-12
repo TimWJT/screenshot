@@ -33,9 +33,10 @@ const MAIN_CLASS: PCWSTR = w!("TimWJT.Screenshot.Main");
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_HOOKED: u32 = WM_APP + 2;
 const TIMER_CAPTURE: usize = 1;
+const TIMER_TRAY: usize = 2;
 const HK_MAIN: i32 = 1;
 const COPYDATA_ARGS: usize = 0x5353;
-const WM_CHECK_EXIT: u32 = WM_APP + 3;
+const COPYDATA_SAVED: usize = 0x5354;
 
 const CMD_REGION: usize = 1;
 const CMD_FULL: usize = 2;
@@ -53,6 +54,9 @@ thread_local! {
     static PENDING_FULL: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static LAST_LAUNCH: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    static TRAY_TRIES: Cell<u32> = const { Cell::new(0) };
+    /// The file the last "saved" notification was about, opened when it's clicked.
+    static LAST_SAVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn main_hwnd() -> HWND {
@@ -61,22 +65,53 @@ pub fn main_hwnd() -> HWND {
 
 pub fn error_box(owner: HWND, text: &str) {
     let t = wide(text);
+    // With no owner, keep it above anything topmost so it can't end up hidden.
+    let top = if owner.is_invalid() { MB_TOPMOST } else { MESSAGEBOX_STYLE(0) };
     unsafe {
-        MessageBoxW(Some(owner), pcwstr(&t), w!("Screenshot"), MB_OK | MB_ICONWARNING);
+        MessageBoxW(Some(owner), pcwstr(&t), w!("Screenshot"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | top);
+    }
+}
+
+/// Save `img` as a new PNG in the save folder (Pictures\Screenshots unless Settings says
+/// otherwise). The error is a message ready to show.
+pub fn save_to_folder(img: &Image) -> Result<std::path::PathBuf, String> {
+    let dir = settings::get().save_path();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = util::unique_path(&dir, &util::timestamp_name(), "png");
+    match gfx::save_image(img, &path) {
+        Ok(()) => Ok(path),
+        Err(e) => Err(format!("Could not save {}\n\n{e}", path.display())),
     }
 }
 
 /// When "also save every copied screenshot" is on, drop a PNG in the save folder.
 pub fn autosave(img: &Image) {
-    let cfg = settings::get();
-    if !cfg.autosave {
+    if !settings::get().autosave {
         return;
     }
-    let dir = cfg.save_path();
-    let _ = std::fs::create_dir_all(&dir);
-    let path = util::unique_path(&dir, &util::timestamp_name(), "png");
-    if let Err(e) = gfx::save_image(img, &path) {
-        error_box(HWND::default(), &format!("Could not save {}\n\n{e}", path.display()));
+    if let Err(msg) = save_to_folder(img) {
+        error_box(HWND::default(), &msg);
+    }
+}
+
+/// Have the tray app say where a screenshot was saved; clicking the notification opens it.
+pub fn notify_saved(path: &std::path::Path) {
+    send_to_tray(COPYDATA_SAVED, &path.to_string_lossy());
+}
+
+/// Pass `text` to the running tray app. False when it isn't running.
+fn send_to_tray(kind: usize, text: &str) -> bool {
+    unsafe {
+        let Ok(tray) = FindWindowW(MAIN_CLASS, None) else { return false };
+        // Let it come to the front if what it's asked to do opens a window (Settings).
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(tray, Some(&mut pid));
+        let _ = AllowSetForegroundWindow(pid);
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let cds = COPYDATASTRUCT { dwData: kind, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+        // A timeout, so a busy or hung tray app can't freeze the caller.
+        let _ = SendMessageTimeoutW(tray, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 2000, None);
+        true
     }
 }
 
@@ -84,6 +119,8 @@ pub fn autosave(img: &Image) {
 struct Args {
     /// Internal: this process is a one-off capture started by the tray process.
     capture: bool,
+    /// Close the tray app, its pins and any open capture (the uninstaller uses this).
+    quit: bool,
     tray_only: bool,
     settings: bool,
     full: bool,
@@ -97,6 +134,7 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Args {
         match s.as_str() {
             "--tray" => a.tray_only = true,
             "--capture" => a.capture = true,
+            "--quit" => a.quit = true,
             "--full" => a.full = true,
             "--settings" => a.settings = true,
             "--delay" => a.delay = it.next().and_then(|n| n.parse().ok()).unwrap_or(3),
@@ -165,31 +203,63 @@ fn capture_now(full: bool) {
     }
 }
 
-/// Ask the capture process to quit once nothing of it is left on screen.
+/// Wake the capture process's message loop so it sees whether anything is left on screen.
 pub fn check_exit() {
     unsafe {
-        let _ = PostThreadMessageW(GetCurrentThreadId(), WM_CHECK_EXIT, WPARAM(0), LPARAM(0));
+        let _ = PostThreadMessageW(GetCurrentThreadId(), WM_NULL, WPARAM(0), LPARAM(0));
     }
 }
 
 fn capture_main(full: bool) {
     unsafe {
+        // One editor at a time, even if two captures were started in quick succession.
+        let Ok(busy) = CreateMutexW(None, false, w!("TimWJT.Screenshot.Overlay")) else { return };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(busy);
+            return;
+        }
+        let mut busy = Some(busy);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    }
-    settings::load();
-    let Some(shot) = capture::grab_screen() else { return };
-    overlay::open(shot, full);
-    unsafe {
+        settings::load();
+        if let Some(shot) = capture::grab_screen() {
+            overlay::open(shot, full);
+        }
+        // Checked before every wait rather than on a posted message: a dialog's own message
+        // loop would swallow that message and leave the process running with nothing on screen.
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.hwnd.is_invalid() && msg.message == WM_CHECK_EXIT {
-                if !overlay::is_open() && pin::count() == 0 {
-                    break;
+        while overlay::is_open() || pin::count() > 0 {
+            if !overlay::is_open() {
+                if let Some(h) = busy.take() {
+                    let _ = CloseHandle(h);
                 }
-                continue;
+            }
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                break;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Close every window of every running copy, then wait (briefly) for the processes to go.
+fn quit_running() {
+    let classes = [MAIN_CLASS, overlay::CLASS, pin::CLASS];
+    unsafe {
+        for class in classes {
+            let mut after: Option<HWND> = None;
+            while let Ok(h) = FindWindowExW(None, after, class, None) {
+                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                after = Some(h);
+            }
+        }
+        for _ in 0..50 {
+            if classes.iter().all(|&c| FindWindowW(c, None).is_err()) {
+                // The windows are gone; give the processes a moment to finish exiting.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
@@ -225,6 +295,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LR
             for slot in &HOOK_KEYS {
                 let v = slot.load(Ordering::Relaxed);
                 if v != 0 && (v & 0xffff_ffff) as u32 == k.vkCode && (v >> 32) as u32 == mods {
+                    if mods & (MOD_ALT.0 | MOD_WIN.0) != 0 {
+                        // Swallowing the key leaves Alt or Win pressed on its own, and releasing
+                        // it would open the app's menu bar or the Start menu. A dummy key
+                        // (0xE8 is unassigned) in between stops that.
+                        let key = |flags| INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xe8), dwFlags: flags, ..Default::default() } },
+                        };
+                        SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
+                    }
                     let _ = PostMessageW(Some(main_hwnd()), WM_HOOKED, WPARAM(0), LPARAM(0));
                     return LRESULT(1);
                 }
@@ -247,6 +327,17 @@ fn ensure_hook_thread() {
             DispatchMessageW(&msg);
         }
     });
+}
+
+/// Stop listening for the shortcuts while Settings is in front, so pressing them in the
+/// shortcut box records them instead of starting a capture. `apply_hotkeys` turns them back on.
+pub fn suspend_hotkeys() {
+    unsafe {
+        let _ = UnregisterHotKey(Some(main_hwnd()), HK_MAIN);
+    }
+    for slot in &HOOK_KEYS {
+        slot.store(0, Ordering::Relaxed);
+    }
 }
 
 pub fn apply_hotkeys() {
@@ -306,13 +397,26 @@ fn tray_data() -> NOTIFYICONDATAW {
     nid
 }
 
-fn add_tray() {
+/// Add the tray icon. False when the taskbar isn't ready yet (early in sign-in).
+fn add_tray() -> bool {
     let mut nid = tray_data();
     nid.uFlags |= NIF_ICON | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAY;
     unsafe {
         nid.hIcon = LoadIconMetric(Some(hinstance()), PCWSTR(1 as _), LIM_SMALL).unwrap_or_default();
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        // An add that timed out may still have gone through, so a working modify counts too.
+        Shell_NotifyIconW(NIM_ADD, &nid).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
+    }
+}
+
+/// Add the tray icon, retrying every two seconds for a minute if the taskbar isn't up yet.
+fn add_tray_retrying() {
+    unsafe {
+        let _ = KillTimer(Some(main_hwnd()), TIMER_TRAY);
+        if !add_tray() {
+            TRAY_TRIES.with(|t| t.set(0));
+            SetTimer(Some(main_hwnd()), TIMER_TRAY, 2000, None);
+        }
     }
 }
 
@@ -324,6 +428,8 @@ fn update_tray_tip() {
 }
 
 fn tray_balloon(title: &str, text: &str) {
+    // Clicking this one shouldn't open a file an earlier notification was about.
+    LAST_SAVED.with(|s| s.borrow_mut().take());
     let mut nid = tray_data();
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
@@ -413,6 +519,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 // Wait for the tray overflow flyout, if the icon lives there, to close.
                 WM_LBUTTONUP => capture_after(false, 0, 250),
                 WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(),
+                NIN_BALLOONUSERCLICK => {
+                    // A "Screenshot saved" notification: show the file in its folder.
+                    if let Some(path) = LAST_SAVED.with(|s| s.borrow_mut().take()) {
+                        let params = wide(&format!("/select,\"{path}\""));
+                        ShellExecuteW(None, w!("open"), w!("explorer.exe"), pcwstr(&params), None, SW_SHOWNORMAL);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -422,17 +535,40 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             capture_now(PENDING_FULL.with(|p| p.get()));
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIMER_TRAY => {
+            let tries = TRAY_TRIES.with(|t| {
+                t.set(t.get() + 1);
+                t.get()
+            });
+            if add_tray() || tries >= 30 {
+                let _ = KillTimer(Some(hwnd), TIMER_TRAY);
+            }
+            LRESULT(0)
+        }
         WM_COPYDATA => {
             let cds = &*(lp.0 as *const COPYDATASTRUCT);
-            if cds.dwData == COPYDATA_ARGS && !cds.lpData.is_null() {
-                let words = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
-                let text = String::from_utf16_lossy(words);
-                let args = parse_args(text.split('\n').filter(|s| !s.is_empty()).map(String::from));
-                if args.tray_only && !args.settings {
-                    tray_balloon("Screenshot is already running", "It lives in the tray, by the clock.");
-                } else {
-                    run_args(&args);
+            if cds.lpData.is_null() {
+                return LRESULT(1);
+            }
+            let words = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
+            let text = String::from_utf16_lossy(words);
+            match cds.dwData {
+                COPYDATA_ARGS => {
+                    let args = parse_args(text.split('\n').filter(|s| !s.is_empty()).map(String::from));
+                    if args.tray_only && !args.settings {
+                        tray_balloon("Screenshot is already running", "It lives in the tray, by the clock.");
+                    } else {
+                        run_args(&args);
+                    }
                 }
+                COPYDATA_SAVED => {
+                    let path = std::path::Path::new(&text);
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                    tray_balloon("Screenshot saved", &format!("{name}\nin {folder}\nClick to show it."));
+                    LAST_SAVED.with(|s| *s.borrow_mut() = Some(text));
+                }
+                _ => {}
             }
             LRESULT(1)
         }
@@ -443,7 +579,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         m if m == TASKBAR_CREATED.with(|t| t.get()) && m != 0 => {
             // Explorer restarted; put the icon back.
-            add_tray();
+            add_tray_retrying();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -459,15 +595,9 @@ fn forward_to_running(raw_args: &[String]) -> bool {
             std::mem::forget(mutex);
             return false;
         }
-        let Ok(other) = FindWindowW(MAIN_CLASS, None) else { return true };
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(other, Some(&mut pid));
-        let _ = AllowSetForegroundWindow(pid);
-        let text: Vec<u16> = raw_args.join("\n").encode_utf16().collect();
-        let cds = COPYDATASTRUCT { dwData: COPYDATA_ARGS, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-        SendMessageW(other, WM_COPYDATA, Some(WPARAM(0)), Some(LPARAM(&cds as *const _ as isize)));
-        true
     }
+    send_to_tray(COPYDATA_ARGS, &raw_args.join("\n"));
+    true
 }
 
 fn main() {
@@ -475,6 +605,10 @@ fn main() {
     let args = parse_args(raw_args.clone());
     if args.capture {
         capture_main(args.full);
+        return;
+    }
+    if args.quit {
+        quit_running();
         return;
     }
     if forward_to_running(&raw_args) {
@@ -520,7 +654,7 @@ fn main() {
         TASKBAR_CREATED.with(|t| t.set(RegisterWindowMessageW(w!("TaskbarCreated"))));
     }
 
-    add_tray();
+    add_tray_retrying();
     apply_hotkeys();
 
     if first_run {
@@ -544,5 +678,27 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Args {
+        parse_args(s.split_whitespace().map(String::from))
+    }
+
+    #[test]
+    fn parses_arguments() {
+        let a = args("--full --delay 5");
+        assert!(a.full && !a.capture && !a.quit && a.delay == 5);
+        assert_eq!(args("--delay").delay, 3, "a bare --delay falls back to 3 seconds");
+        assert_eq!(args("--delay soon").delay, 3);
+        assert!(args("--tray --settings").settings);
+        assert!(args("--quit").quit);
+        assert!(args("--capture --full").capture);
+        let none = args("--unknown");
+        assert!(!none.full && !none.tray_only && none.delay == 0);
     }
 }

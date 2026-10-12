@@ -158,6 +158,32 @@ pub fn bitmap_of(rt: &ID2D1RenderTarget, img: &Image, x: u32, y: u32, w: u32, h:
     }
 }
 
+pub type Tiles = Vec<(D2D_RECT_F, ID2D1Bitmap)>;
+
+/// The sub-rectangle (x, y, w, h) of `img` as bitmaps no bigger than `rt` allows, each with
+/// where it goes relative to (x, y). GPUs stop at 16384 px, which a row of monitors can pass.
+pub fn tiles_of(rt: &ID2D1RenderTarget, img: &Image, x: u32, y: u32, w: u32, h: u32) -> Tiles {
+    let max = unsafe { rt.GetMaximumBitmapSize() }.max(256);
+    let mut out = Vec::new();
+    for ty in (0..h).step_by(max as usize) {
+        for tx in (0..w).step_by(max as usize) {
+            let (tw, th) = (max.min(w - tx), max.min(h - ty));
+            if let Some(b) = bitmap_of(rt, img, x + tx, y + ty, tw, th) {
+                out.push((rf(tx as f32, ty as f32, (tx + tw) as f32, (ty + th) as f32), b));
+            }
+        }
+    }
+    out
+}
+
+pub fn draw_tiles(rt: &ID2D1RenderTarget, tiles: &Tiles) {
+    for (dest, b) in tiles {
+        unsafe {
+            rt.DrawBitmap(b, Some(dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
+        }
+    }
+}
+
 /// Render something off-screen into a new `w`×`h` image.
 pub fn render_image(w: u32, h: u32, draw: impl FnOnce(&ID2D1RenderTarget)) -> Option<Image> {
     with(|g| unsafe {
@@ -293,8 +319,10 @@ pub fn paste_text(owner: HWND) -> Option<String> {
             if p.is_null() {
                 return None;
             }
+            // Stop at the end of the block even if the app that put it there left off the NUL.
+            let max = GlobalSize(mem) / 2;
             let mut n = 0;
-            while *p.add(n) != 0 {
+            while n < max && *p.add(n) != 0 {
                 n += 1;
             }
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));

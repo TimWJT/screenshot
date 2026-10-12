@@ -24,7 +24,7 @@ thread_local! {
     static PINS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
 }
 
-const CLASS: PCWSTR = w!("TimWJT.Screenshot.Pin");
+pub const CLASS: PCWSTR = w!("TimWJT.Screenshot.Pin");
 const BORDER: i32 = 1;
 
 pub fn count() -> usize {
@@ -115,6 +115,7 @@ const CMD_SAVE: usize = 2;
 const CMD_ZOOM: usize = 3;
 const CMD_CLOSE: usize = 4;
 const CMD_CLOSE_ALL: usize = 5;
+const CMD_SAVE_AS: usize = 6;
 
 unsafe fn command(hwnd: HWND, cmd: usize) {
     let Some(p) = pin(hwnd) else { return };
@@ -122,7 +123,11 @@ unsafe fn command(hwnd: HWND, cmd: usize) {
         CMD_COPY => {
             gfx::copy_image(hwnd, &p.img);
         }
-        CMD_SAVE => {
+        CMD_SAVE => match crate::save_to_folder(&p.img) {
+            Ok(path) => crate::notify_saved(&path),
+            Err(msg) => crate::error_box(hwnd, &msg),
+        },
+        CMD_SAVE_AS => {
             let img = p.img.clone();
             if let Some(path) = dialogs::save_as(hwnd, &settings::get().save_path(), &timestamp_name()) {
                 if let Err(e) = gfx::save_image(&img, &path) {
@@ -236,6 +241,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match VIRTUAL_KEY(wp.0 as u16) {
                 VK_ESCAPE => command(hwnd, CMD_CLOSE),
                 VK_C if ctrl => command(hwnd, CMD_COPY),
+                VK_S if ctrl && GetKeyState(VK_SHIFT.0 as i32) < 0 => command(hwnd, CMD_SAVE_AS),
                 VK_S if ctrl => command(hwnd, CMD_SAVE),
                 VK_0 if ctrl => command(hwnd, CMD_ZOOM),
                 _ => {}
@@ -249,7 +255,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = AppendMenuW(menu, MF_STRING, id, crate::util::pcwstr(&t));
             };
             item(CMD_COPY, "Copy\tCtrl+C");
-            item(CMD_SAVE, "Save as…\tCtrl+S");
+            item(CMD_SAVE, "Save\tCtrl+S");
+            item(CMD_SAVE_AS, "Save as…\tCtrl+Shift+S");
             item(CMD_ZOOM, "Actual size\tCtrl+0");
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             item(CMD_CLOSE, "Close\tEsc");

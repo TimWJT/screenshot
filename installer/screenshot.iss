@@ -43,12 +43,16 @@ Name: "{group}\Uninstall Screenshot"; Filename: "{uninstallexe}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Screenshot"; ValueData: """{app}\screenshot.exe"" --tray"; Flags: uninsdeletevalue; Tasks: startup
+; Settings can turn "start with Windows" on later, so remove the value on uninstall either way.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Screenshot"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
 Filename: "{app}\screenshot.exe"; Parameters: "--tray"; Description: "Start Screenshot now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "{sys}\taskkill.exe"; Parameters: "/f /im screenshot.exe"; Flags: runhidden; RunOnceId: "StopScreenshot"
+; Closes this app's tray icon, pins and any open capture (not every process that happens to be
+; called screenshot.exe) and waits for them to exit.
+Filename: "{app}\screenshot.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "StopScreenshot"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\Screenshot"

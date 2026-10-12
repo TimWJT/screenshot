@@ -1,5 +1,7 @@
 //! Things drawn on top of a capture, and how each one renders and hit-tests.
 
+use std::cell::RefCell;
+
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -76,7 +78,7 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Annot {
     pub tool: Tool,
     pub color: u32,
@@ -87,6 +89,9 @@ pub struct Annot {
     /// Freehand: every point. Shapes: two corners / two ends. Text and steps: the anchor.
     pub pts: Vec<[f32; 2]>,
     pub text: String,
+    /// Pixelate: the averaged blocks from the last draw, keyed by area and block size, so
+    /// redrawing on every mouse move doesn't average the whole area again.
+    pub pixels: RefCell<Option<([i32; 5], Image)>>,
 }
 
 pub fn text_px(size: f32) -> f32 {
@@ -97,8 +102,9 @@ fn step_radius(size: f32) -> f32 {
     9.0 + size * 1.4
 }
 
+/// Big enough at every size that text underneath can't be read back out of the averages.
 fn pixel_block(size: f32) -> f32 {
-    (4.0 + size * 1.5).round()
+    (10.0 + size * 2.0).round()
 }
 
 fn marker_width(size: f32) -> f32 {
@@ -133,7 +139,7 @@ impl Annot {
             Tool::Pen | Tool::Marker | Tool::Text | Tool::Step => vec![at],
             _ => vec![at, at],
         };
-        Annot { tool, color, size, fill, scale, pts, text: String::new() }
+        Annot { tool, color, size, fill, scale, pts, text: String::new(), pixels: RefCell::new(None) }
     }
 
     pub fn translate(&mut self, dx: f32, dy: f32) {
@@ -335,14 +341,14 @@ impl Annot {
                     let fg = brush(rt, contrast(self.color), 1.0);
                     rt.DrawTextLayout(v2(x - r, y - r - r * 0.06), &layout, &fg, D2D1_DRAW_TEXT_OPTIONS_NONE);
                 }
-                Tool::Pixelate => draw_pixelate(rt, src, self.pts[0], self.pts[1], pixel_block(self.size) * self.scale),
+                Tool::Pixelate => draw_pixelate(rt, src, self.pts[0], self.pts[1], pixel_block(self.size) * self.scale, &self.pixels),
                 Tool::Select => {}
             }
         });
     }
 }
 
-fn draw_pixelate(rt: &ID2D1RenderTarget, src: &Image, a: [f32; 2], b: [f32; 2], block: f32) {
+fn draw_pixelate(rt: &ID2D1RenderTarget, src: &Image, a: [f32; 2], b: [f32; 2], block: f32, cache: &RefCell<Option<([i32; 5], Image)>>) {
     let (l, t, r, b) = norm(a, b);
     let (l, t) = (l.max(0.0).floor() as i32, t.max(0.0).floor() as i32);
     let (r, b) = ((r.ceil() as i32).min(src.w as i32), (b.ceil() as i32).min(src.h as i32));
@@ -350,6 +356,26 @@ fn draw_pixelate(rt: &ID2D1RenderTarget, src: &Image, a: [f32; 2], b: [f32; 2], 
         return;
     }
     let bs = block.max(2.0) as i32;
+    let cols = ((r - l) + bs - 1) / bs;
+    let rows = ((b - t) + bs - 1) / bs;
+    let key = [l, t, r, b, bs];
+    let mut cache = cache.borrow_mut();
+    if !cache.as_ref().is_some_and(|(k, _)| *k == key) {
+        *cache = Some((key, average_blocks(src, l, t, r, b, bs)));
+    }
+    let small = &cache.as_ref().unwrap().1;
+    if let Some(bmp) = gfx::bitmap_of(rt, small, 0, 0, small.w, small.h) {
+        unsafe {
+            rt.PushAxisAlignedClip(&rf(l as f32, t as f32, r as f32, b as f32), D2D1_ANTIALIAS_MODE_ALIASED);
+            let dest = rf(l as f32, t as f32, (l + cols * bs) as f32, (t + rows * bs) as f32);
+            rt.DrawBitmap(&bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
+            rt.PopAxisAlignedClip();
+        }
+    }
+}
+
+/// One averaged pixel per `bs`×`bs` block of the area (l, t)–(r, b) of `src`.
+fn average_blocks(src: &Image, l: i32, t: i32, r: i32, b: i32, bs: i32) -> Image {
     let cols = ((r - l) + bs - 1) / bs;
     let rows = ((b - t) + bs - 1) / bs;
     let mut px = vec![255u8; (cols * rows * 4) as usize];
@@ -375,13 +401,67 @@ fn draw_pixelate(rt: &ID2D1RenderTarget, src: &Image, a: [f32; 2], b: [f32; 2], 
             }
         }
     }
-    let small = Image { w: cols as u32, h: rows as u32, px };
-    if let Some(bmp) = gfx::bitmap_of(rt, &small, 0, 0, small.w, small.h) {
-        unsafe {
-            rt.PushAxisAlignedClip(&rf(l as f32, t as f32, r as f32, b as f32), D2D1_ANTIALIAS_MODE_ALIASED);
-            let dest = rf(l as f32, t as f32, (l + cols * bs) as f32, (t + rows * bs) as f32);
-            rt.DrawBitmap(&bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None);
-            rt.PopAxisAlignedClip();
+    Image { w: cols as u32, h: rows as u32, px }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(tool: Tool, fill: bool, a: [f32; 2], b: [f32; 2]) -> Annot {
+        let mut s = Annot::new(tool, 0, 3.0, fill, 1.0, a);
+        s.pts = vec![a, b];
+        s
+    }
+
+    #[test]
+    fn outlines_hit_on_the_edge_only() {
+        let r = shape(Tool::Rect, false, [100.0, 100.0], [200.0, 200.0]);
+        assert!(r.hit(100.0, 150.0));
+        assert!(!r.hit(150.0, 150.0), "an outline is not hit in its middle");
+        assert!(!r.hit(50.0, 50.0));
+        let f = shape(Tool::Rect, true, [100.0, 100.0], [200.0, 200.0]);
+        assert!(f.hit(150.0, 150.0), "a filled shape is");
+
+        let e = shape(Tool::Ellipse, false, [0.0, 0.0], [200.0, 100.0]);
+        assert!(e.hit(200.0, 50.0));
+        assert!(!e.hit(100.0, 50.0));
+    }
+
+    #[test]
+    fn lines_hit_near_the_segment() {
+        let l = shape(Tool::Line, false, [0.0, 0.0], [100.0, 0.0]);
+        assert!(l.hit(50.0, 4.0));
+        assert!(!l.hit(50.0, 20.0));
+        assert!(!l.hit(130.0, 0.0), "not beyond the end");
+    }
+
+    #[test]
+    fn tiny_shapes_are_dropped() {
+        assert!(!shape(Tool::Rect, false, [10.0, 10.0], [11.0, 11.0]).meaningful());
+        assert!(shape(Tool::Rect, false, [10.0, 10.0], [20.0, 11.0]).meaningful());
+        let mut t = Annot::new(Tool::Text, 0, 3.0, false, 1.0, [0.0, 0.0]);
+        assert!(!t.meaningful());
+        t.text = "  ".into();
+        assert!(!t.meaningful());
+        t.text = "hi".into();
+        assert!(t.meaningful());
+    }
+
+    #[test]
+    fn pixelate_blocks_average_and_cover_the_area() {
+        let (w, h) = (40u32, 20u32);
+        let mut px = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                px[i] = if (x + y) % 2 == 0 { 0 } else { 200 };
+            }
         }
+        let src = Image { w, h, px };
+        let small = average_blocks(&src, 0, 0, 40, 20, 16);
+        assert_eq!((small.w, small.h), (3, 2));
+        assert_eq!(small.px[0], 100, "a checkerboard averages to the middle");
+        assert!(pixel_block(1.0) >= 12.0, "blocks stay coarse even at the smallest size");
     }
 }

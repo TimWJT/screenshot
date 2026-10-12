@@ -2,7 +2,7 @@
 
 A tiny screenshot tool for Windows. Press a key, drag a box, draw on it, paste it anywhere.
 
-One 300 KB exe with no runtime and no installer required. It sits in the tray using about 2 MB of memory and does nothing until you press the shortcut.
+One 500 KB exe with no runtime and no installer required. It sits in the tray using about 2 MB of memory and does nothing until you press the shortcut.
 
 ## Download
 
@@ -46,7 +46,7 @@ Running `screenshot.exe` also starts a capture, and puts the app in the tray if 
 | **Draw** | Rectangle, ellipse, arrow, line, pen, highlighter, text, numbered steps and pixelate. Eight colours plus a colour picker, three sizes (the mouse wheel fine-tunes), filled or outlined shapes. |
 | **Edit** | Move, recolour, resize or delete anything you drew with the select tool. Undo and redo everything. |
 | **Copy** | `Enter`, `Ctrl`+`C` or double-click. |
-| **Save** | `Ctrl`+`S` saves a PNG or JPEG. Optionally every copied screenshot is also saved to a folder automatically. |
+| **Save** | `Ctrl`+`S` saves a PNG straight to `Pictures\Screenshots` and closes; click the notification to see it. `Ctrl`+`Shift`+`S` picks a name, folder, or JPEG. Optionally every copied screenshot is also saved there automatically. |
 | **Pin** | `Ctrl`+`P` leaves the screenshot floating on top of everything. Drag it around, scroll to zoom, `Ctrl`+scroll for transparency, double-click or `Esc` to close. |
 | **Delay** | Tray menu → *Capture after a delay* gives a 3, 5 or 10 second countdown, for menus and tooltips that close when you press a key. |
 | **Pick a colour** | Before selecting, press `C` to copy the hex code of the pixel under the cursor. |
@@ -80,7 +80,8 @@ Once something is selected:
 | `Delete` | Delete the selected drawing |
 | Arrow keys | Move the selection or the selected drawing (`Shift`: 10 px) |
 | `Enter` / `Ctrl`+`C` | Copy and close |
-| `Ctrl`+`S` | Save as… |
+| `Ctrl`+`S` | Save to the screenshots folder and close |
+| `Ctrl`+`Shift`+`S` | Save as… |
 | `Ctrl`+`P` | Pin to screen |
 | right-click | Start over (if nothing is drawn yet) |
 | `Esc` | Close without copying |
@@ -91,10 +92,10 @@ While typing text, `Enter` makes a new line, `Ctrl`+`V` pastes, and `Esc` or cli
 
 Right-click the tray icon → **Settings…**
 
-- **Capture shortcut**: any key combination. Defaults to `Alt`+`F1`.
+- **Capture shortcut**: any key combination with `Ctrl` or `Alt`, or a function key on its own. Defaults to `Alt`+`F1`.
 - **Print Screen key also captures**: on by default. This takes the key over from Windows' Snipping Tool while the app is running.
 - **Start with Windows**
-- **Save folder**: defaults to `Pictures\Screenshots`.
+- **Save folder**: where `Ctrl`+`S` saves. Defaults to `Pictures\Screenshots` (created if missing; if OneDrive backs up your Pictures, that's the OneDrive one).
 - **Also save every copied screenshot to this folder**
 
 Settings are stored in `%APPDATA%\Screenshot\settings.ini`.
@@ -109,6 +110,7 @@ screenshot.exe --full       capture with the whole monitor already selected
 screenshot.exe --delay 5    capture after a 5 second countdown
 screenshot.exe --tray       just start in the tray
 screenshot.exe --settings   open Settings
+screenshot.exe --quit       close the tray app, pinned screenshots and any open capture
 ```
 
 ## Why it's light
@@ -124,7 +126,7 @@ Needs [Rust](https://rustup.rs) with the MSVC toolchain (Visual Studio Build Too
 cargo build --release
 ```
 
-The exe lands in `target/release/screenshot.exe`. `cargo test` renders the editor off-screen to `target/scene-*.png`, so the UI can be checked without opening a window.
+The exe lands in `target/release/screenshot.exe`, with the C runtime linked in (see `.cargo/config.toml`), so it needs nothing else installed. `cargo test` renders the editor off-screen to `target/scene-*.png`, so the UI can be checked without opening a window.
 
 To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
 
@@ -151,7 +153,7 @@ The icon is drawn by code: `node tools/make-icon.mjs` regenerates `assets/icon.i
 
 ## Releasing
 
-Bump the version in `Cargo.toml` and `assets/app.rc`, then tag:
+Bump the version in `Cargo.toml`, `assets/app.rc` (both `FILEVERSION` lines and the strings) and `assets/app.manifest`, then tag. The release build stops if any of them, or the tag, disagree.
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0

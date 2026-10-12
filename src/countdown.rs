@@ -5,7 +5,7 @@ use std::cell::Cell;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::util::{hinstance, wide};
@@ -45,15 +45,20 @@ pub fn start(secs: u32, full: bool) {
         let mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(mon, &mut mi);
+        // Sized for that monitor's scale and created in place, so it never changes DPI.
+        let (mut dpi, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
+        let size = 120 * dpi.max(96) as i32 / 96;
+        let r = mi.rcWork;
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             CLASS,
             w!("Screenshot countdown"),
             WS_POPUP,
-            0,
-            0,
-            10,
-            10,
+            r.left + (r.right - r.left - size) / 2,
+            r.top + (r.bottom - r.top - size) / 2,
+            size,
+            size,
             None,
             None,
             Some(hinstance()),
@@ -61,17 +66,6 @@ pub fn start(secs: u32, full: bool) {
         ) else {
             return;
         };
-        let size = 120 * GetDpiForWindow(hwnd).max(96) as i32 / 96;
-        let r = mi.rcWork;
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            r.left + (r.right - r.left - size) / 2,
-            r.top + (r.bottom - r.top - size) / 2,
-            size,
-            size,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
         let rgn = CreateRoundRectRgn(0, 0, size + 1, size + 1, size / 4, size / 4);
         SetWindowRgn(hwnd, Some(rgn), false);
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 225, LWA_ALPHA);
@@ -146,6 +140,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // Already sized for the monitor it sits on; ignore the size Windows suggests.
+        WM_DPICHANGED => LRESULT(0),
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
