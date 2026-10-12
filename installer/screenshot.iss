@@ -48,6 +48,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\screenshot.exe"; Parameters: "--tray"; Description: "Start Screenshot now"; Flags: nowait postinstall skipifsilent
+; An update from inside the app runs setup silently; start the app again afterwards.
+Filename: "{app}\screenshot.exe"; Parameters: "--tray"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 ; Closes this app's tray icon, pins and any open capture (not every process that happens to be

@@ -10,6 +10,7 @@ mod gfx;
 mod overlay;
 mod pin;
 mod settings;
+mod update;
 mod util;
 
 use std::cell::Cell;
@@ -32,9 +33,11 @@ use crate::util::{hinstance, pcwstr, wide};
 const MAIN_CLASS: PCWSTR = w!("TimWJT.Screenshot.Main");
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_HOOKED: u32 = WM_APP + 2;
+const WM_UPDATE: u32 = WM_APP + 3;
 const TIMER_CAPTURE: usize = 1;
 const TIMER_TRAY: usize = 2;
 const TIMER_STANDBY: usize = 3;
+const TIMER_UPDATE: usize = 4;
 const STANDBY_REGION: PCWSTR = w!("Local\\TimWJT.Screenshot.Standby");
 const STANDBY_FULL: PCWSTR = w!("Local\\TimWJT.Screenshot.StandbyFull");
 const HK_MAIN: i32 = 1;
@@ -50,8 +53,12 @@ const CMD_FOLDER: usize = 6;
 const CMD_UNPIN: usize = 7;
 const CMD_SETTINGS: usize = 8;
 const CMD_EXIT: usize = 9;
+const CMD_CHECK_UPDATE: usize = 10;
+const CMD_UPDATE: usize = 11;
 
 static MAIN: AtomicIsize = AtomicIsize::new(0);
+/// The single-instance mutex, let go of just before running an update's installer.
+static INSTANCE: AtomicIsize = AtomicIsize::new(0);
 
 thread_local! {
     static PENDING_FULL: Cell<bool> = const { Cell::new(false) };
@@ -60,6 +67,13 @@ thread_local! {
     static TRAY_TRIES: Cell<u32> = const { Cell::new(0) };
     /// The file the last "saved" notification was about, opened when it's clicked.
     static LAST_SAVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// A newer release than this one, once a check has found it.
+    static UPDATE: std::cell::RefCell<Option<update::Release>> = const { std::cell::RefCell::new(None) };
+    /// The last notification shown was about `UPDATE`.
+    static UPDATE_BALLOON: Cell<bool> = const { Cell::new(false) };
+    /// The version an automatic check last told the user about, so it only says so once.
+    static UPDATE_TOLD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static DOWNLOADING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn main_hwnd() -> HWND {
@@ -313,6 +327,95 @@ fn run_capture(full: bool) {
     }
 }
 
+// ---- updates -----------------------------------------------------------------------------
+
+fn update_done(done: update::Done) {
+    let current = env!("CARGO_PKG_VERSION");
+    match done {
+        update::Done::Checked { manual, result: Ok(rel) } if update::is_newer(&rel.version, current) => {
+            let v = rel.version.clone();
+            UPDATE.with(|u| *u.borrow_mut() = Some(rel));
+            if manual {
+                offer_update();
+            } else if UPDATE_TOLD.with(|t| t.replace(v.clone())) != v {
+                tray_balloon(&format!("Screenshot {v} is available"), "Click here to update, or use \"Install update\" in the tray menu.");
+                UPDATE_BALLOON.with(|u| u.set(true));
+            }
+        }
+        update::Done::Checked { manual: true, result: Ok(_) } => {
+            tray_balloon("Screenshot is up to date", &format!("You have the latest version, {current}."));
+        }
+        update::Done::Checked { manual: true, result: Err(e) } => error_box(HWND::default(), &format!("Could not check for updates.\n\n{e}")),
+        // Automatic checks stay quiet when offline.
+        update::Done::Checked { .. } => {}
+        update::Done::Downloaded(Ok(path)) => run_installer(&path),
+        update::Done::Downloaded(Err(e)) => {
+            DOWNLOADING.with(|d| d.set(false));
+            error_box(HWND::default(), &format!("Could not download the update.\n\n{e}"));
+        }
+    }
+}
+
+fn ask(text: &str) -> bool {
+    let t = wide(text);
+    let style = MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST;
+    unsafe { MessageBoxW(None, pcwstr(&t), w!("Screenshot update"), style) == IDYES }
+}
+
+fn offer_update() {
+    if DOWNLOADING.with(|d| d.get()) {
+        return;
+    }
+    let Some(rel) = UPDATE.with(|u| u.borrow().clone()) else { return };
+    let head = format!("Screenshot {} is available. You have {}.", rel.version, env!("CARGO_PKG_VERSION"));
+    if !update::installed() {
+        // The portable exe: let the user download the new one themselves.
+        if ask(&format!("{head}\n\nOpen the download page?")) {
+            let page = wide(update::PAGE);
+            unsafe {
+                ShellExecuteW(None, w!("open"), pcwstr(&page), None, None, SW_SHOWNORMAL);
+            }
+        }
+        return;
+    }
+    if ask(&format!("{head}\n\nDownload and install it now? Screenshot closes while it updates, then starts again. Pinned screenshots will close.")) {
+        DOWNLOADING.with(|d| d.set(true));
+        tray_balloon("Downloading the update…", "Screenshot will restart when it's installed.");
+        update::download(main_hwnd(), WM_UPDATE, rel);
+    }
+}
+
+/// Close this app's captures and pins, start the installer, then exit so it can replace the
+/// exe. The installer starts the app again when it's done.
+fn run_installer(path: &std::path::Path) {
+    unsafe {
+        for class in [overlay::CLASS, pin::CLASS] {
+            let mut after: Option<HWND> = None;
+            while let Ok(h) = FindWindowExW(None, after, class, None) {
+                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                after = Some(h);
+            }
+        }
+        // Setup refuses to run while this is held.
+        let m = INSTANCE.swap(0, Ordering::Relaxed);
+        if m != 0 {
+            let _ = CloseHandle(HANDLE(m as *mut _));
+        }
+    }
+    match std::process::Command::new(path).args(["/SILENT", "/NORESTART"]).spawn() {
+        Ok(_) => unsafe {
+            let _ = DestroyWindow(main_hwnd());
+        },
+        Err(e) => {
+            DOWNLOADING.with(|d| d.set(false));
+            if let Ok(m) = unsafe { CreateMutexW(None, false, w!("TimWJT.Screenshot.Instance")) } {
+                INSTANCE.store(m.0 as isize, Ordering::Relaxed);
+            }
+            error_box(HWND::default(), &format!("Could not start the installer.\n\n{e}"));
+        }
+    }
+}
+
 /// Close every window of every running copy, then wait (briefly) for the processes to go.
 fn quit_running() {
     let classes = [MAIN_CLASS, overlay::CLASS, pin::CLASS];
@@ -499,8 +602,9 @@ fn update_tray_tip() {
 }
 
 fn tray_balloon(title: &str, text: &str) {
-    // Clicking this one shouldn't open a file an earlier notification was about.
+    // Clicking this one shouldn't act on what an earlier notification was about.
     LAST_SAVED.with(|s| s.borrow_mut().take());
+    UPDATE_BALLOON.with(|u| u.set(false));
     let mut nid = tray_data();
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
@@ -544,6 +648,10 @@ fn tray_menu() {
         if pin::any_open() {
             add(menu, CMD_UNPIN, "Close all pinned screenshots");
         }
+        match UPDATE.with(|u| u.borrow().as_ref().map(|r| r.version.clone())) {
+            Some(v) => add(menu, CMD_UPDATE, &format!("Install update ({v})…")),
+            None => add(menu, CMD_CHECK_UPDATE, "Check for updates"),
+        }
         add(menu, CMD_SETTINGS, "Settings…");
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         add(menu, CMD_EXIT, "Exit");
@@ -571,6 +679,8 @@ fn tray_menu() {
             }
             CMD_UNPIN => pin::close_all(),
             CMD_SETTINGS => settings::show(),
+            CMD_CHECK_UPDATE => update::check(hwnd, WM_UPDATE, true),
+            CMD_UPDATE => offer_update(),
             CMD_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -591,8 +701,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 WM_LBUTTONUP => capture_after(false, 0, 250),
                 WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(),
                 NIN_BALLOONUSERCLICK => {
+                    if UPDATE_BALLOON.with(|u| u.replace(false)) {
+                        offer_update();
+                    }
                     // A "Screenshot saved" notification: show the file in its folder.
-                    if let Some(path) = LAST_SAVED.with(|s| s.borrow_mut().take()) {
+                    else if let Some(path) = LAST_SAVED.with(|s| s.borrow_mut().take()) {
                         let params = wide(&format!("/select,\"{path}\""));
                         ShellExecuteW(None, w!("open"), w!("explorer.exe"), pcwstr(&params), None, SW_SHOWNORMAL);
                     }
@@ -609,6 +722,20 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER if wp.0 == TIMER_STANDBY => {
             let _ = KillTimer(Some(hwnd), TIMER_STANDBY);
             start_standby();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TIMER_UPDATE => {
+            if settings::get().check_updates {
+                update::check(hwnd, WM_UPDATE, false);
+            }
+            // Then once a day, for a tray app that stays running for weeks.
+            SetTimer(Some(hwnd), TIMER_UPDATE, 24 * 60 * 60 * 1000, None);
+            LRESULT(0)
+        }
+        WM_UPDATE => {
+            for done in update::take() {
+                update_done(done);
+            }
             LRESULT(0)
         }
         WM_TIMER if wp.0 == TIMER_TRAY => {
@@ -668,7 +795,9 @@ fn forward_to_running(raw_args: &[String]) -> bool {
         let mutex = CreateMutexW(None, false, w!("TimWJT.Screenshot.Instance"));
         if GetLastError() != ERROR_ALREADY_EXISTS {
             // Keep the handle open for the life of the process.
-            std::mem::forget(mutex);
+            if let Ok(m) = mutex {
+                INSTANCE.store(m.0 as isize, Ordering::Relaxed);
+            }
             return false;
         }
     }
@@ -741,6 +870,10 @@ fn main() {
     add_tray_retrying();
     apply_hotkeys();
     start_standby();
+    // The first update check waits a minute, to stay out of the way while Windows starts up.
+    unsafe {
+        SetTimer(Some(main_hwnd()), TIMER_UPDATE, 60 * 1000, None);
+    }
 
     if first_run {
         settings::update(|_| {});

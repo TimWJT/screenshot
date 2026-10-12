@@ -27,6 +27,7 @@ pub struct Config {
     pub color: u32,
     pub size: f32,
     pub fill: bool,
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -40,6 +41,7 @@ impl Default for Config {
             color: 0xe53935,
             size: 3.0,
             fill: false,
+            check_updates: true,
         }
     }
 }
@@ -87,6 +89,7 @@ fn parse(text: &str) -> Config {
             "color" => c.color = u32::from_str_radix(v.trim_start_matches('#'), 16).unwrap_or(c.color),
             "size" => c.size = v.parse::<f32>().unwrap_or(c.size).clamp(1.0, 40.0),
             "fill" => c.fill = flag,
+            "check_updates" => c.check_updates = flag,
             _ => {}
         }
     }
@@ -95,8 +98,16 @@ fn parse(text: &str) -> Config {
 
 fn format(c: &Config) -> String {
     format!(
-        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\n",
-        c.hotkey_mods, c.hotkey_vk, c.printscreen as u8, c.save_dir, c.autosave as u8, c.color, c.size, c.fill as u8
+        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\ncheck_updates={}\n",
+        c.hotkey_mods,
+        c.hotkey_vk,
+        c.printscreen as u8,
+        c.save_dir,
+        c.autosave as u8,
+        c.color,
+        c.size,
+        c.fill as u8,
+        c.check_updates as u8
     )
 }
 
@@ -191,6 +202,7 @@ const ID_DIR: i32 = 104;
 const ID_BROWSE: i32 = 105;
 const ID_AUTOSAVE: i32 = 106;
 const ID_LINK: i32 = 107;
+const ID_UPDATES: i32 = 108;
 const ID_OK: i32 = 1;
 const ID_CANCEL: i32 = 2;
 
@@ -297,18 +309,19 @@ unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
     let dir = child(w!("EDIT"), &cfg.save_path().to_string_lossy(), ES_AUTOHSCROLL as u32 | tab | WS_BORDER.0, ID_DIR, 16, 156, 316, 24);
     child(w!("BUTTON"), "Browse…", BS_PUSHBUTTON as u32 | tab, ID_BROWSE, 340, 155, 84, 26);
     let auto = child(w!("BUTTON"), "Also save every copied screenshot to this folder", check, ID_AUTOSAVE, 16, 188, 400, 22);
+    let updates = child(w!("BUTTON"), "Tell me when there's a new version", check, ID_UPDATES, 16, 214, 400, 22);
     child(
         WC_LINK,
         &format!("Screenshot {} by Tim  ·  <a href=\"https://github.com/TimWJT/screenshot\">GitHub</a>", env!("CARGO_PKG_VERSION")),
         tab,
         ID_LINK,
         16,
-        234,
+        260,
         230,
         20,
     );
-    child(w!("BUTTON"), "Save", BS_DEFPUSHBUTTON as u32 | tab, ID_OK, 252, 228, 84, 28);
-    child(w!("BUTTON"), "Cancel", BS_PUSHBUTTON as u32 | tab, ID_CANCEL, 340, 228, 84, 28);
+    child(w!("BUTTON"), "Save", BS_DEFPUSHBUTTON as u32 | tab, ID_OK, 252, 254, 84, 28);
+    child(w!("BUTTON"), "Cancel", BS_PUSHBUTTON as u32 | tab, ID_CANCEL, 340, 254, 84, 28);
 
     let mut flags = 0;
     if cfg.hotkey_mods & MOD_SHIFT.0 != 0 {
@@ -327,10 +340,11 @@ unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
     set(prtsc, cfg.printscreen);
     set(startup, autostart_enabled());
     set(auto, cfg.autosave);
+    set(updates, cfg.check_updates);
     let _ = dir;
 
-    // Size the window around a 440×270 client area and centre it on the primary monitor.
-    let mut r = RECT { left: 0, top: 0, right: px(440), bottom: px(270) };
+    // Size the window around a 440×296 client area and centre it on the primary monitor.
+    let mut r = RECT { left: 0, top: 0, right: px(440), bottom: px(296) };
     let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE::default(), dpi);
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     let mut work = RECT::default();
@@ -385,12 +399,14 @@ unsafe fn apply(hwnd: HWND) -> bool {
     }
     let prtsc = checked(hwnd, ID_PRTSC);
     let auto = checked(hwnd, ID_AUTOSAVE);
+    let updates = checked(hwnd, ID_UPDATES);
     update(|c| {
         c.hotkey_mods = mods;
         c.hotkey_vk = vk;
         c.printscreen = prtsc;
         c.save_dir = dir;
         c.autosave = auto;
+        c.check_updates = updates;
     });
     set_autostart(checked(hwnd, ID_STARTUP));
     crate::apply_hotkeys();
@@ -473,7 +489,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true };
+        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true, check_updates: false };
         let back = parse(&format(&c));
         assert_eq!(format(&back), format(&c));
     }

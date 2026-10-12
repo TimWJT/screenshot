@@ -97,6 +97,7 @@ Right-click the tray icon → **Settings…**
 - **Start with Windows**
 - **Save folder**: where `Ctrl`+`S` saves. Defaults to `Pictures\Screenshots` (created if missing; if OneDrive backs up your Pictures, that's the OneDrive one).
 - **Also save every copied screenshot to this folder**
+- **Tell me when there's a new version**: on by default. Once a day the app checks GitHub for a newer release and shows a notification. Click it (or **Install update** in the tray menu) to download and install it; the app restarts on the new version. The portable exe opens the download page instead. Right-click the tray icon → **Check for updates** to check now.
 
 Settings are stored in `%APPDATA%\Screenshot\settings.ini`.
 
