@@ -1,12 +1,15 @@
 //! The full-screen capture window: pick a region, draw on it, then copy, save or pin.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION};
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::Matrix3x2;
@@ -142,9 +145,92 @@ struct Bars {
     below: bool,
 }
 
+/// The screenshot as GDI bitmaps, plain and dimmed, for the frames drawn before Direct2D is up.
+struct GdiShot {
+    plain: (HDC, HBITMAP, HGDIOBJ),
+    dim: (HDC, HBITMAP, HGDIOBJ),
+}
+
+impl GdiShot {
+    fn new(img: &Image) -> Option<Self> {
+        let make = |dim: bool| unsafe {
+            let bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: img.w as i32,
+                    biHeight: -(img.h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let out = std::slice::from_raw_parts_mut(bits as *mut u8, img.px.len());
+            if dim {
+                // The same 45% black the Direct2D frame lays over everything outside the selection.
+                for (o, &p) in out.iter_mut().zip(&img.px) {
+                    *o = ((p as u32 * 141) >> 8) as u8;
+                }
+            } else {
+                out.copy_from_slice(&img.px);
+            }
+            let dc = CreateCompatibleDC(None);
+            let old = SelectObject(dc, bmp.into());
+            Some((dc, bmp, old))
+        };
+        Some(GdiShot { plain: make(false)?, dim: make(true)? })
+    }
+}
+
+impl Drop for GdiShot {
+    fn drop(&mut self) {
+        for (dc, bmp, old) in [self.plain, self.dim] {
+            unsafe {
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+            }
+        }
+    }
+}
+
+/// Starting the graphics driver is most of the time it takes to show the first Direct2D frame,
+/// so it starts on another thread, alongside grabbing the screen, while GDI draws meanwhile.
+/// The device is only kept until the window's own render target exists.
+static WARM_DONE: AtomicBool = AtomicBool::new(false);
+static WARM_DEVICE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+static OVERLAY_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+pub fn warm_gpu() {
+    std::thread::spawn(|| unsafe {
+        let mut dev: Option<ID3D11Device> = None;
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        let _ = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None);
+        if let Some(d) = dev {
+            WARM_DEVICE.store(d.into_raw(), Ordering::Release);
+        }
+        WARM_DONE.store(true, Ordering::Release);
+        let hwnd = HWND(OVERLAY_HWND.load(Ordering::Acquire));
+        if !hwnd.is_invalid() {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    });
+}
+
+fn release_warm_device() {
+    let p = WARM_DEVICE.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if !p.is_null() {
+        drop(unsafe { ID3D11Device::from_raw(p) });
+    }
+}
+
 struct Overlay {
     hwnd: HWND,
     rt: Option<ID2D1HwndRenderTarget>,
+    gdi: Option<GdiShot>,
     /// The screenshot, uploaded to `rt`.
     tiles: gfx::Tiles,
     shot: Shot,
@@ -237,6 +323,7 @@ pub fn open(shot: Shot, full: bool) {
         let mut o = Overlay {
             hwnd,
             rt: None,
+            gdi: None,
             tiles: Vec::new(),
             shot,
             wins,
@@ -264,7 +351,11 @@ pub fn open(shot: Shot, full: bool) {
         } else {
             o.update_hover();
         }
+        if !WARM_DONE.load(Ordering::Acquire) {
+            o.gdi = GdiShot::new(&o.shot.img);
+        }
         OVERLAY.with(|cell| *cell.borrow_mut() = Some(o));
+        OVERLAY_HWND.store(hwnd.0, Ordering::Release);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         crate::util::force_foreground(hwnd);
@@ -281,7 +372,9 @@ fn close() {
             c.fill = o.fill;
         });
         let hwnd = o.hwnd;
+        OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::Release);
         drop(o);
+        release_warm_device();
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
@@ -1153,10 +1246,16 @@ impl Overlay {
         let img = &self.shot.img;
         self.tiles = gfx::tiles_of(&rt, img, 0, 0, img.w, img.h);
         self.rt = Some(rt);
+        self.gdi = None;
+        release_warm_device();
         Some(())
     }
 
     fn paint(&mut self) {
+        if self.rt.is_none() && self.gdi.is_some() && !WARM_DONE.load(Ordering::Acquire) {
+            self.paint_gdi();
+            return;
+        }
         if self.ensure_target().is_none() {
             return;
         }
@@ -1173,6 +1272,42 @@ impl Overlay {
                     self.redraw();
                 }
             }
+        }
+    }
+
+    /// Just the screenshot, dimmed outside the selection, with its border.
+    fn paint_gdi(&self) {
+        let Some(g) = &self.gdi else { return };
+        let (w, h) = (self.shot.img.w as i32, self.shot.img.h as i32);
+        unsafe {
+            let hdc = GetDC(Some(self.hwnd));
+            let blt = |src: HDC, l: i32, t: i32, r: i32, b: i32| {
+                if r > l && b > t {
+                    let _ = BitBlt(hdc, l, t, r - l, b - t, Some(src), l, t, SRCCOPY);
+                }
+            };
+            match self.live_region().or(self.hover) {
+                Some(r) => {
+                    blt(g.dim.0, 0, 0, w, r.t);
+                    blt(g.dim.0, 0, r.b, w, h);
+                    blt(g.dim.0, 0, r.t, r.l, r.b);
+                    blt(g.dim.0, r.r, r.t, w, r.b);
+                    blt(g.plain.0, r.l, r.t, r.r, r.b);
+                    let bw = (1.5 * self.scale()).round().max(1.0) as i32;
+                    let accent = CreateSolidBrush(COLORREF(gfx_bgr(ACCENT)));
+                    for (l, t, rr, b) in [
+                        (r.l - bw, r.t - bw, r.r + bw, r.t),
+                        (r.l - bw, r.b, r.r + bw, r.b + bw),
+                        (r.l - bw, r.t, r.l, r.b),
+                        (r.r, r.t, r.r + bw, r.b),
+                    ] {
+                        FillRect(hdc, &RECT { left: l, top: t, right: rr, bottom: b }, accent);
+                    }
+                    let _ = DeleteObject(accent.into());
+                }
+                None => blt(g.dim.0, 0, 0, w, h),
+            }
+            ReleaseDC(Some(self.hwnd), hdc);
         }
     }
 
@@ -1512,6 +1647,11 @@ impl Overlay {
     }
 }
 
+/// 0xRRGGBB as a GDI COLORREF.
+fn gfx_bgr(rgb: u32) -> u32 {
+    (rgb & 0xff) << 16 | (rgb & 0xff00) | (rgb >> 16) & 0xff
+}
+
 fn snap_angle(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let len = (dx * dx + dy * dy).sqrt();
@@ -1568,6 +1708,7 @@ mod tests {
         let mut o = Overlay {
             hwnd: HWND::default(),
             rt: None,
+            gdi: None,
             tiles: vec![],
             shot,
             wins: vec![],

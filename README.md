@@ -2,7 +2,7 @@
 
 A tiny screenshot tool for Windows. Press a key, drag a box, draw on it, paste it anywhere.
 
-One 500 KB exe with no runtime and no installer required. It sits in the tray using about 2 MB of memory and does nothing until you press the shortcut.
+One 500 KB exe with no runtime and no installer required. It sits in the tray using about 4 MB of memory and does nothing until you press the shortcut.
 
 ## Download
 
@@ -116,7 +116,7 @@ screenshot.exe --quit       close the tray app, pinned screenshots and any open 
 ## Why it's light
 
 - Pure Rust against the Win32 API. Drawing uses Direct2D and DirectWrite, images go through WIC, so everything it needs ships with Windows.
-- The tray process only handles the shortcut, the tray icon and settings. Each capture runs in a short-lived second process that exits when you're done. Direct2D and the graphics driver hold on to over 100 MB after drawing a full-screen image and only give it back when the process exits, so this keeps the always-running part at about 2 MB.
+- The tray process only handles the shortcut, the tray icon and settings. Each capture runs in a short-lived second process that exits when you're done. Direct2D and the graphics driver hold on to over 100 MB after drawing a full-screen image and only give it back when the process exits, so this keeps the always-running part at about 2 MB. The next capture process is started ahead of time and waits, already loaded (about 2 MB more), so pressing the shortcut only has to wake it. Its first frame is drawn with plain GDI while the graphics driver starts up on another thread, then Direct2D takes over.
 
 ## Build from source
 

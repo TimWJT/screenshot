@@ -20,7 +20,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
@@ -34,6 +34,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_HOOKED: u32 = WM_APP + 2;
 const TIMER_CAPTURE: usize = 1;
 const TIMER_TRAY: usize = 2;
+const TIMER_STANDBY: usize = 3;
+const STANDBY_REGION: PCWSTR = w!("Local\\TimWJT.Screenshot.Standby");
+const STANDBY_FULL: PCWSTR = w!("Local\\TimWJT.Screenshot.StandbyFull");
 const HK_MAIN: i32 = 1;
 const COPYDATA_ARGS: usize = 0x5353;
 const COPYDATA_SAVED: usize = 0x5354;
@@ -119,6 +122,8 @@ fn send_to_tray(kind: usize, text: &str) -> bool {
 struct Args {
     /// Internal: this process is a one-off capture started by the tray process.
     capture: bool,
+    /// Internal: wait, ready, to be a capture for the tray process with this ID.
+    standby: Option<u32>,
     /// Close the tray app, its pins and any open capture (the uninstaller uses this).
     quit: bool,
     tray_only: bool,
@@ -134,6 +139,7 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Args {
         match s.as_str() {
             "--tray" => a.tray_only = true,
             "--capture" => a.capture = true,
+            "--standby" => a.standby = it.next().and_then(|n| n.parse().ok()),
             "--quit" => a.quit = true,
             "--full" => a.full = true,
             "--settings" => a.settings = true,
@@ -182,7 +188,8 @@ fn capture_busy() -> bool {
 
 // Each capture runs in a short-lived child process. Direct2D and the graphics driver keep
 // 100+ MB of memory around after the editor closes, and only exiting gives it back, so the
-// tray process never touches Direct2D and stays at a couple of megabytes.
+// tray process never touches Direct2D and stays at a couple of megabytes. A standby child is
+// started ahead of time, so a capture doesn't wait for a process to start up.
 fn capture_now(full: bool) {
     if capture_busy() {
         return;
@@ -192,14 +199,71 @@ fn capture_now(full: bool) {
         // Let the child take the foreground; this process got the hotkey, so it may pass that on.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--capture");
-    if full {
-        cmd.arg("--full");
-    }
-    if cmd.spawn().is_ok() {
+    let started = wake_standby(full) || {
+        let mut args = vec!["--capture".to_string()];
+        if full {
+            args.push("--full".into());
+        }
+        spawn_self(&args)
+    };
+    if started {
         LAST_LAUNCH.with(|t| t.set(Some(std::time::Instant::now())));
+    }
+    // Have the next one ready, once this one is done starting.
+    unsafe {
+        SetTimer(Some(main_hwnd()), TIMER_STANDBY, 1500, None);
+    }
+}
+
+fn spawn_self(args: &[String]) -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    std::process::Command::new(exe).args(args).spawn().is_ok()
+}
+
+fn wake_standby(full: bool) -> bool {
+    unsafe {
+        let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, if full { STANDBY_FULL } else { STANDBY_REGION }) else {
+            return false;
+        };
+        let ok = SetEvent(ev).is_ok();
+        let _ = CloseHandle(ev);
+        ok
+    }
+}
+
+fn start_standby() {
+    unsafe {
+        if let Ok(ev) = OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, STANDBY_REGION) {
+            let _ = CloseHandle(ev);
+            return;
+        }
+    }
+    spawn_self(&["--standby".into(), std::process::id().to_string()]);
+}
+
+/// Load everything a capture needs, then wait to be woken by the tray process.
+fn standby_main(tray_pid: u32) {
+    unsafe {
+        let Ok(tray) = OpenProcess(PROCESS_SYNCHRONIZE, false, tray_pid) else { return };
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        gfx::with(|_| ());
+        let Ok(region) = CreateEventW(None, false, false, STANDBY_REGION) else { return };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Another standby is already waiting.
+            let _ = CloseHandle(region);
+            return;
+        }
+        let Ok(full) = CreateEventW(None, false, false, STANDBY_FULL) else { return };
+        let woke = WaitForMultipleObjects(&[region, full, tray], false, INFINITE);
+        // Gone from view at once, so the tray starts a new standby instead of waking this one.
+        let _ = CloseHandle(region);
+        let _ = CloseHandle(full);
+        let _ = CloseHandle(tray);
+        match woke {
+            WAIT_OBJECT_0 => run_capture(false),
+            w if w.0 == WAIT_OBJECT_0.0 + 1 => run_capture(true),
+            _ => {}
+        }
     }
 }
 
@@ -212,6 +276,13 @@ pub fn check_exit() {
 
 fn capture_main(full: bool) {
     unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    run_capture(full);
+}
+
+fn run_capture(full: bool) {
+    unsafe {
         // One editor at a time, even if two captures were started in quick succession.
         let Ok(busy) = CreateMutexW(None, false, w!("TimWJT.Screenshot.Overlay")) else { return };
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -219,7 +290,7 @@ fn capture_main(full: bool) {
             return;
         }
         let mut busy = Some(busy);
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        overlay::warm_gpu();
         settings::load();
         if let Some(shot) = capture::grab_screen() {
             overlay::open(shot, full);
@@ -535,6 +606,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             capture_now(PENDING_FULL.with(|p| p.get()));
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIMER_STANDBY => {
+            let _ = KillTimer(Some(hwnd), TIMER_STANDBY);
+            start_standby();
+            LRESULT(0)
+        }
         WM_TIMER if wp.0 == TIMER_TRAY => {
             let tries = TRAY_TRIES.with(|t| {
                 t.set(t.get() + 1);
@@ -603,9 +679,17 @@ fn forward_to_running(raw_args: &[String]) -> bool {
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(raw_args.clone());
-    if args.capture {
-        capture_main(args.full);
-        return;
+    if args.capture || args.standby.is_some() {
+        match args.standby {
+            Some(pid) => standby_main(pid),
+            None => capture_main(args.full),
+        }
+        // Everything is saved by now. Exiting normally runs the Direct2D and Direct3D teardown,
+        // which faults (0x87A) once the windows are gone, and Windows then spends seconds on a
+        // crash report while holding on to the memory. Ending the process outright skips that.
+        unsafe {
+            let _ = TerminateProcess(GetCurrentProcess(), 0);
+        }
     }
     if args.quit {
         quit_running();
@@ -656,6 +740,7 @@ fn main() {
 
     add_tray_retrying();
     apply_hotkeys();
+    start_standby();
 
     if first_run {
         settings::update(|_| {});
