@@ -65,6 +65,8 @@ thread_local! {
     static PENDING_FULL: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     static LAST_LAUNCH: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// The timer that starts the next standby process is running.
+    static STANDBY_PENDING: Cell<bool> = const { Cell::new(false) };
     static TRAY_TRIES: Cell<u32> = const { Cell::new(0) };
     /// The file the last "saved" notification was about, opened when it's clicked.
     static LAST_SAVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -230,7 +232,10 @@ fn capture_now(full: bool) {
     }
     // Have the next one ready, once this one is done starting.
     unsafe {
-        SetTimer(Some(main_hwnd()), TIMER_STANDBY, 1500, None);
+        // Not pushed back by a second quick capture, which would leave it with none ready.
+        if !STANDBY_PENDING.with(|p| p.replace(true)) {
+            SetTimer(Some(main_hwnd()), TIMER_STANDBY, 1500, None);
+        }
     }
 }
 
@@ -427,21 +432,23 @@ fn offer_update() {
 /// exe. The installer starts the app again when it's done.
 fn run_installer(path: &std::path::Path) {
     unsafe {
-        for class in [overlay::CLASS, pin::CLASS] {
-            let mut after: Option<HWND> = None;
-            while let Ok(h) = FindWindowExW(None, after, class, None) {
-                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
-                after = Some(h);
-            }
-        }
         // Setup refuses to run while this is held.
         let m = INSTANCE.swap(0, Ordering::Relaxed);
         if m != 0 {
             let _ = CloseHandle(HANDLE(m as *mut _));
         }
     }
+    // Close captures and pins only once setup has started: Windows can refuse to run it
+    // (Smart App Control, antivirus), and then they'd be lost for nothing.
     match std::process::Command::new(path).args(["/SILENT", "/NORESTART"]).spawn() {
         Ok(_) => unsafe {
+            for class in [overlay::CLASS, pin::CLASS] {
+                let mut after: Option<HWND> = None;
+                while let Ok(h) = FindWindowExW(None, after, class, None) {
+                    let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    after = Some(h);
+                }
+            }
             let _ = DestroyWindow(main_hwnd());
         },
         Err(e) => {
@@ -777,6 +784,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_TIMER if wp.0 == TIMER_STANDBY => {
             let _ = KillTimer(Some(hwnd), TIMER_STANDBY);
+            STANDBY_PENDING.with(|p| p.set(false));
             start_standby();
             LRESULT(0)
         }

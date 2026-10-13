@@ -86,6 +86,11 @@ impl Rc {
     fn span(ax: i32, ay: i32, bx: i32, by: i32) -> Self {
         Rc { l: ax.min(bx), t: ay.min(by), r: ax.max(bx), b: ay.max(by) }
     }
+    /// The pixels from (ax, ay) to (bx, by), both included: a drag keeps the pixel it started on
+    /// and the one it ended on, whichever way it went.
+    fn pixels(ax: i32, ay: i32, bx: i32, by: i32) -> Self {
+        Rc { l: ax.min(bx), t: ay.min(by), r: ax.max(bx) + 1, b: ay.max(by) + 1 }
+    }
     fn w(&self) -> i32 {
         self.r - self.l
     }
@@ -181,7 +186,17 @@ impl GdiShot {
             let old = SelectObject(dc, bmp.into());
             Some((dc, bmp, old))
         };
-        Some(GdiShot { plain: make(false)?, dim: make(true)? })
+        let plain = make(false)?;
+        let Some(dim) = make(true) else {
+            let (dc, bmp, old) = plain;
+            unsafe {
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+            }
+            return None;
+        };
+        Some(GdiShot { plain, dim })
     }
 }
 
@@ -263,7 +278,8 @@ struct Overlay {
     redo: Vec<Vec<Annot>>,
     current: Option<Annot>,
     typing: bool,
-    typing_saved: bool,
+    /// Text being edited again: where it sat in the stack, and how it was.
+    typing_orig: Option<(usize, Annot)>,
     selected: Option<usize>,
     hot: Option<Btn>,
     /// Show the magnifier without Shift held.
@@ -357,7 +373,7 @@ pub fn open(shot: Shot, full: bool) {
             redo: Vec::new(),
             current: None,
             typing: false,
-            typing_saved: false,
+            typing_orig: None,
             selected: None,
             hot: None,
             magnifier: cfg.magnifier,
@@ -590,7 +606,7 @@ impl Overlay {
     /// Region as shown right now, including one being dragged out.
     fn live_region(&self) -> Option<Rc> {
         if let Drag::NewRegion { ax, ay } = self.drag {
-            return Some(Rc::span(ax, ay, self.mx, self.my).clip(&self.screen()).unwrap_or(Rc { l: ax, t: ay, r: ax, b: ay }));
+            return Some(Rc::pixels(ax, ay, self.mx, self.my).clip(&self.screen()).unwrap_or(Rc { l: ax, t: ay, r: ax, b: ay }));
         }
         self.region
     }
@@ -719,7 +735,7 @@ impl Overlay {
 
     fn recolor_selected(&mut self) {
         if let Some(i) = self.selected {
-            if !self.annots[i].tool.colorless() {
+            if !self.annots[i].tool.colorless() && self.annots[i].color != self.color {
                 self.save_undo();
                 self.annots[i].color = self.color;
             }
@@ -731,8 +747,10 @@ impl Overlay {
 
     fn resize_selected(&mut self) {
         if let Some(i) = self.selected {
-            self.save_undo();
-            self.annots[i].size = self.size;
+            if self.annots[i].size != self.size {
+                self.save_undo();
+                self.annots[i].size = self.size;
+            }
         }
         if let Some(c) = self.current.as_mut() {
             c.size = self.size;
@@ -768,14 +786,14 @@ impl Overlay {
         self.commit_text();
         let hit = self.annots.iter().rposition(|a| a.tool == Tool::Text && a.hit(x as f32, y as f32));
         if let Some(i) = hit {
-            self.save_undo();
-            self.current = Some(self.annots.remove(i));
-            self.typing_saved = true;
+            let a = self.annots.remove(i);
+            self.typing_orig = Some((i, a.clone()));
+            self.current = Some(a);
         } else {
             // Put the click at the middle of the first line rather than its top.
             let px = crate::annot::text_px(self.size) * self.scale();
             self.current = Some(Annot::new(Tool::Text, self.color, self.size, false, self.scale(), [x as f32, y as f32 - px * 0.66]));
-            self.typing_saved = false;
+            self.typing_orig = None;
         }
         self.typing = true;
         self.selected = None;
@@ -787,11 +805,27 @@ impl Overlay {
         }
         self.typing = false;
         if let Some(a) = self.current.take() {
-            if a.meaningful() {
-                if !self.typing_saved {
-                    self.save_undo();
+            match self.typing_orig.take() {
+                // Text edited again goes back where it was in the stack, and is an undo step
+                // only if it actually changed.
+                Some((i, orig)) => {
+                    let i = i.min(self.annots.len());
+                    if a.text != orig.text || a.color != orig.color || a.size != orig.size {
+                        let mut before = self.annots.clone();
+                        before.insert(i, orig);
+                        self.undo.push(before);
+                        self.redo.clear();
+                    }
+                    if a.meaningful() {
+                        self.annots.insert(i, a);
+                    }
                 }
-                self.annots.push(a);
+                None => {
+                    if a.meaningful() {
+                        self.save_undo();
+                        self.annots.push(a);
+                    }
+                }
             }
         }
         self.redraw();
@@ -853,6 +887,10 @@ impl Overlay {
     }
 
     fn annot_at(&self, x: i32, y: i32) -> Option<usize> {
+        // Drawings are cut off at the selection's edge, so the parts outside it can't be clicked.
+        if !self.region.is_some_and(|r| r.contains(x, y)) {
+            return None;
+        }
         self.annots.iter().rposition(|a| a.hit(x as f32, y as f32))
     }
 
@@ -1032,7 +1070,7 @@ impl Overlay {
                     self.update_hover();
                     self.hover
                 } else {
-                    Rc::span(ax, ay, x, y).clip(&self.screen())
+                    Rc::pixels(ax, ay, x, y).clip(&self.screen())
                 };
                 if self.region.is_some_and(|r| r.w() < 2 || r.h() < 2) {
                     self.region = None;
@@ -1788,7 +1826,7 @@ mod tests {
             redo: vec![],
             current: None,
             typing: false,
-            typing_saved: false,
+            typing_orig: None,
             selected: None,
             hot: Some(Btn::Tool(Tool::Arrow)),
             magnifier: true,
@@ -1830,6 +1868,34 @@ mod tests {
         o.hover = Some(Rc { l: 300, t: 200, r: 1700, b: 1000 });
         o.hot = None;
         render(&mut o, "scene-pick");
+    }
+
+    /// A drag keeps both the pixel it started on and the one it ended on, either way round.
+    #[test]
+    fn drag_includes_both_end_pixels() {
+        let down = Rc::pixels(10, 20, 14, 23);
+        let up = Rc::pixels(14, 23, 10, 20);
+        assert_eq!((down.l, down.t, down.w(), down.h()), (10, 20, 5, 4));
+        assert_eq!((up.l, up.t, up.w(), up.h()), (10, 20, 5, 4));
+        assert!(down.contains(10, 20) && down.contains(14, 23));
+    }
+
+    /// Saving over a file replaces it whole and leaves no temporary file behind.
+    #[test]
+    fn save_replaces_and_cleans_up() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let dir = std::env::temp_dir().join(format!("ss-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        std::fs::write(&path, b"old contents").unwrap();
+        let img = Image { w: 4, h: 3, px: vec![200; 48] };
+        gfx::save_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[1..4], b"PNG");
+        assert!(!dir.join("shot.png.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cropping gives the same pixels as drawing through Direct2D, and copies resize.

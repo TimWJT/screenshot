@@ -150,7 +150,9 @@ fn get(url: &str, follow_redirects: bool) -> Result<Response, String> {
         let location = WinHttpQueryHeaders(req.0, WINHTTP_QUERY_LOCATION, PCWSTR::null(), Some(loc.as_mut_ptr() as *mut _), &mut len, std::ptr::null_mut())
             .ok()
             .map(|_| from_wide(&loc[..len as usize / 2]));
-        if status >= 400 {
+        // A 404 is an answer (no release, or no installer attached yet), not a network problem;
+        // the callers say what's missing.
+        if status >= 400 && status != 404 {
             return Err(fail(&format!("HTTP {status}")));
         }
         let mut body = Vec::new();

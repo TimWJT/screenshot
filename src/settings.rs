@@ -259,6 +259,7 @@ const HOTKEYF_ALT: u32 = 0x4;
 struct SettingsWindow {
     hwnd: HWND,
     font: HFONT,
+    dpi: u32,
 }
 
 pub fn window() -> Option<HWND> {
@@ -409,7 +410,7 @@ unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
     let y = work.top + (work.bottom - work.top - h) / 2;
     let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER);
 
-    WINDOW.with(|wnd| *wnd.borrow_mut() = Some(SettingsWindow { hwnd, font }));
+    WINDOW.with(|wnd| *wnd.borrow_mut() = Some(SettingsWindow { hwnd, font, dpi }));
     let _ = SetFocus(Some(hk));
 }
 
@@ -541,6 +542,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        // Moved to a monitor with a different scale, or the scale changed: resize the controls
+        // and their font to match, keeping what's typed in them.
+        WM_DPICHANGED => {
+            let new = (wp.0 & 0xffff) as u32;
+            let r = *(lp.0 as *const RECT);
+            WINDOW.with(|w| {
+                let Ok(mut w) = w.try_borrow_mut() else { return };
+                let Some(w) = w.as_mut() else { return };
+                let mut ncm = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+                let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, ncm.cbSize, Some(&mut ncm as *mut _ as *mut _), 0, new);
+                let font = CreateFontIndirectW(&ncm.lfMessageFont);
+                let scale = |v: i32| v * new as i32 / w.dpi.max(1) as i32;
+                let mut child = GetWindow(hwnd, GW_CHILD).ok();
+                while let Some(c) = child {
+                    let mut cr = RECT::default();
+                    let _ = GetWindowRect(c, &mut cr);
+                    let mut pts = [POINT { x: cr.left, y: cr.top }, POINT { x: cr.right, y: cr.bottom }];
+                    MapWindowPoints(None, Some(hwnd), &mut pts);
+                    let (x, y) = (scale(pts[0].x), scale(pts[0].y));
+                    let (cw, ch) = (scale(pts[1].x - pts[0].x), scale(pts[1].y - pts[0].y));
+                    let _ = SetWindowPos(c, None, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
+                    SendMessageW(c, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+                    child = GetWindow(c, GW_HWNDNEXT).ok();
+                }
+                let _ = DeleteObject(w.font.into());
+                w.font = font;
+                w.dpi = new;
+            });
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             LRESULT(0)
         }
         WM_DESTROY => {

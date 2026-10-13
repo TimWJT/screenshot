@@ -210,15 +210,29 @@ pub fn render_image(w: u32, h: u32, draw: impl FnOnce(&ID2D1RenderTarget)) -> Op
     })
 }
 
-/// Write `img` as PNG, or JPEG when the path ends in .jpg/.jpeg.
+/// Write `img` as PNG, or JPEG when the path ends in .jpg/.jpeg. It's written to a temporary
+/// file first, so a failure never leaves a file it was replacing cut short.
 pub fn save_image(img: &Image, path: &Path) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let written = encode_image(img, path, &tmp);
+    let done = written.and_then(|()| std::fs::rename(&tmp, path).map_err(|e| windows::core::Error::new(windows::core::HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32), e.to_string())));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
+/// Encode `img` into `out`, in the format `path`'s extension asks for.
+fn encode_image(img: &Image, path: &Path, out: &Path) -> Result<()> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let (container, mut format): (GUID, GUID) = if ext == "jpg" || ext == "jpeg" {
         (GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR)
     } else {
         (GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR)
     };
-    let name = wide(&path.to_string_lossy());
+    let name = wide(&out.to_string_lossy());
     with(|g| unsafe {
         let src = g.wic.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGR, img.w * 4, &img.px)?;
         let stream = g.wic.CreateStream()?;
