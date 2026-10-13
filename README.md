@@ -2,7 +2,7 @@
 
 A tiny screenshot tool for Windows. Press a key, drag a box, draw on it, paste it anywhere.
 
-One 500 KB exe with no runtime and no installer required. It sits in the tray using about 4 MB of memory and does nothing until you press the shortcut.
+One 500 KB exe with no runtime and no installer required. It sits in the tray and does nothing until you press the shortcut. The tray part uses about 2 MB of memory, plus about 50 MB for a capture process kept ready so the editor opens at once.
 
 ## Download
 
@@ -40,8 +40,8 @@ Running `screenshot.exe` also starts a capture, and puts the app in the tray if 
 
 | | |
 |---|---|
-| **Region, window or full screen** | Drag a box, click a window (it highlights as you hover), or press `F` for the whole monitor and `Ctrl`+`A` for every monitor. |
-| **Magnifier** | A zoomed view of the pixels under the cursor while you select, with coordinates and the colour's hex code. Arrow keys move the cursor one pixel at a time. |
+| **Region, window or full screen** | Drag a box, click a window to grab all of it, or press `F` for the whole monitor and `Ctrl`+`A` for every monitor. |
+| **Magnifier** | Hold `Shift` while selecting for a zoomed view of the pixels under the cursor, with coordinates and the colour's hex code. Arrow keys move the cursor one pixel at a time. Settings can keep it on all the time. |
 | **Adjust** | Drag the edges or handles to resize the selection, drag inside it to move it, or nudge it with the arrow keys. |
 | **Draw** | Rectangle, ellipse, arrow, line, pen, highlighter, text, numbered steps and pixelate. Eight colours plus a colour picker, three sizes (the mouse wheel fine-tunes), filled or outlined shapes. |
 | **Edit** | Move, recolour, resize or delete anything you drew with the select tool. Undo and redo everything. |
@@ -58,10 +58,11 @@ While selecting:
 
 | Key | Does |
 |---|---|
-| `Enter` / `Space` | Select the highlighted window |
+| `Enter` / `Space` | Select the window under the mouse |
 | `F` | Select the whole monitor |
 | `Ctrl`+`A` | Select every monitor |
 | `C` | Copy the colour under the cursor |
+| hold `Shift` | Show the magnifier |
 | Arrow keys | Move the cursor 1 px (`Shift`: 10 px) |
 | `Esc` / right-click | Cancel |
 
@@ -97,6 +98,8 @@ Right-click the tray icon → **Settings…**
 - **Start with Windows**
 - **Save folder**: where `Ctrl`+`S` saves. Defaults to `Pictures\Screenshots` (created if missing; if OneDrive backs up your Pictures, that's the OneDrive one).
 - **Also save every copied screenshot to this folder**
+- **Copied image size**: copies come out at their real pixel size by default; pick 50% to 200% to paste them smaller or larger. Saved files are always the real size.
+- **Always show the magnifier**: off by default; hold `Shift` while selecting to see it.
 - **Tell me when there's a new version**: on by default. Once a day the app checks GitHub for a newer release and shows a notification. Click it (or **Install update** in the tray menu) to download and install it; the app restarts on the new version. The portable exe opens the download page instead. Right-click the tray icon → **Check for updates** to check now.
 
 Settings are stored in `%APPDATA%\Screenshot\settings.ini`.
@@ -117,7 +120,7 @@ screenshot.exe --quit       close the tray app, pinned screenshots and any open 
 ## Why it's light
 
 - Pure Rust against the Win32 API. Drawing uses Direct2D and DirectWrite, images go through WIC, so everything it needs ships with Windows.
-- The tray process only handles the shortcut, the tray icon and settings. Each capture runs in a short-lived second process that exits when you're done. Direct2D and the graphics driver hold on to over 100 MB after drawing a full-screen image and only give it back when the process exits, so this keeps the always-running part at about 2 MB. The next capture process is started ahead of time and waits, already loaded (about 2 MB more), so pressing the shortcut only has to wake it. Its first frame is drawn with plain GDI while the graphics driver starts up on another thread, then Direct2D takes over.
+- The tray process only handles the shortcut, the tray icon and settings. Each capture runs in a short-lived second process that exits when you're done. Direct2D and the graphics driver hold on to over 100 MB after drawing a full-screen image and only give it back when the process exits, so this keeps the always-running part at about 2 MB. The next capture process is started ahead of time and waits with the graphics driver already started (about 50 MB more; starting the driver takes up to two seconds on some laptops), so pressing the shortcut only has to wake it. It greys the screen out at once with a see-through window that Windows keeps out of screen captures, so the screenshot taken underneath is unaffected. If it wasn't ready, the first frame is drawn with plain GDI while the graphics driver starts up on another thread, then Direct2D takes over.
 
 ## Build from source
 

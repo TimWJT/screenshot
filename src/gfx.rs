@@ -239,6 +239,23 @@ pub fn save_image(img: &Image, path: &Path) -> Result<()> {
     })
 }
 
+/// `img` resized to `pct` percent, smoothly.
+pub fn scale_image(img: &Image, pct: u32) -> Option<Image> {
+    let w = (img.w * pct / 100).max(1);
+    let h = (img.h * pct / 100).max(1);
+    with(|g| unsafe {
+        let src = g.wic.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGR, img.w * 4, &img.px).ok()?;
+        let scaler = g.wic.CreateBitmapScaler().ok()?;
+        scaler.Initialize(&src, w, h, WICBitmapInterpolationModeHighQualityCubic).ok()?;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        scaler.CopyPixels(std::ptr::null(), w * 4, &mut px).ok()?;
+        for a in px.iter_mut().skip(3).step_by(4) {
+            *a = 255;
+        }
+        Some(Image { w, h, px })
+    })
+}
+
 pub fn copy_image(owner: HWND, img: &Image) -> bool {
     let header = size_of::<BITMAPINFOHEADER>();
     let row = img.w as usize * 4;

@@ -28,7 +28,14 @@ pub struct Config {
     pub size: f32,
     pub fill: bool,
     pub check_updates: bool,
+    /// Copied screenshots are resized to this percent of their real size.
+    pub copy_scale: u32,
+    /// Show the magnifier while selecting without holding Shift.
+    pub magnifier: bool,
 }
+
+/// The choices for `copy_scale`.
+pub const COPY_SCALES: [u32; 6] = [50, 75, 100, 125, 150, 200];
 
 impl Default for Config {
     fn default() -> Self {
@@ -42,6 +49,8 @@ impl Default for Config {
             size: 3.0,
             fill: false,
             check_updates: true,
+            copy_scale: 100,
+            magnifier: false,
         }
     }
 }
@@ -90,6 +99,8 @@ fn parse(text: &str) -> Config {
             "size" => c.size = v.parse::<f32>().unwrap_or(c.size).clamp(1.0, 40.0),
             "fill" => c.fill = flag,
             "check_updates" => c.check_updates = flag,
+            "copy_scale" => c.copy_scale = num().filter(|n| COPY_SCALES.contains(n)).unwrap_or(c.copy_scale),
+            "magnifier" => c.magnifier = flag,
             _ => {}
         }
     }
@@ -98,7 +109,7 @@ fn parse(text: &str) -> Config {
 
 fn format(c: &Config) -> String {
     format!(
-        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\ncheck_updates={}\n",
+        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\ncheck_updates={}\ncopy_scale={}\nmagnifier={}\n",
         c.hotkey_mods,
         c.hotkey_vk,
         c.printscreen as u8,
@@ -107,7 +118,9 @@ fn format(c: &Config) -> String {
         c.color,
         c.size,
         c.fill as u8,
-        c.check_updates as u8
+        c.check_updates as u8,
+        c.copy_scale,
+        c.magnifier as u8
     )
 }
 
@@ -203,6 +216,8 @@ const ID_BROWSE: i32 = 105;
 const ID_AUTOSAVE: i32 = 106;
 const ID_LINK: i32 = 107;
 const ID_UPDATES: i32 = 108;
+const ID_SCALE: i32 = 109;
+const ID_MAGNIFIER: i32 = 110;
 const ID_OK: i32 = 1;
 const ID_CANCEL: i32 = 2;
 
@@ -310,18 +325,21 @@ unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
     child(w!("BUTTON"), "Browse…", BS_PUSHBUTTON as u32 | tab, ID_BROWSE, 340, 155, 84, 26);
     let auto = child(w!("BUTTON"), "Also save every copied screenshot to this folder", check, ID_AUTOSAVE, 16, 188, 400, 22);
     let updates = child(w!("BUTTON"), "Tell me when there's a new version", check, ID_UPDATES, 16, 214, 400, 22);
+    child(w!("STATIC"), "Copied image size", 0, -1, 16, 251, 130, 20);
+    let scale = child(w!("COMBOBOX"), "", CBS_DROPDOWNLIST as u32 | tab | WS_VSCROLL.0, ID_SCALE, 150, 248, 120, 200);
+    let magnifier = child(w!("BUTTON"), "Always show the magnifier (otherwise hold Shift)", check, ID_MAGNIFIER, 16, 280, 400, 22);
     child(
         WC_LINK,
         &format!("Screenshot {} by Tim  ·  <a href=\"https://github.com/TimWJT/screenshot\">GitHub</a>", env!("CARGO_PKG_VERSION")),
         tab,
         ID_LINK,
         16,
-        260,
+        326,
         230,
         20,
     );
-    child(w!("BUTTON"), "Save", BS_DEFPUSHBUTTON as u32 | tab, ID_OK, 252, 254, 84, 28);
-    child(w!("BUTTON"), "Cancel", BS_PUSHBUTTON as u32 | tab, ID_CANCEL, 340, 254, 84, 28);
+    child(w!("BUTTON"), "Save", BS_DEFPUSHBUTTON as u32 | tab, ID_OK, 252, 320, 84, 28);
+    child(w!("BUTTON"), "Cancel", BS_PUSHBUTTON as u32 | tab, ID_CANCEL, 340, 320, 84, 28);
 
     let mut flags = 0;
     if cfg.hotkey_mods & MOD_SHIFT.0 != 0 {
@@ -341,10 +359,19 @@ unsafe fn build(hwnd: HWND, style: WINDOW_STYLE) {
     set(startup, autostart_enabled());
     set(auto, cfg.autosave);
     set(updates, cfg.check_updates);
+    set(magnifier, cfg.magnifier);
+    for (i, pct) in COPY_SCALES.iter().enumerate() {
+        let label = if *pct == 100 { "100% (actual size)".to_string() } else { format!("{pct}%") };
+        let t = wide(&label);
+        SendMessageW(scale, CB_ADDSTRING, None, Some(LPARAM(t.as_ptr() as isize)));
+        if *pct == cfg.copy_scale {
+            SendMessageW(scale, CB_SETCURSEL, Some(WPARAM(i)), None);
+        }
+    }
     let _ = dir;
 
-    // Size the window around a 440×296 client area and centre it on the primary monitor.
-    let mut r = RECT { left: 0, top: 0, right: px(440), bottom: px(296) };
+    // Size the window around a 440×362 client area and centre it on the primary monitor.
+    let mut r = RECT { left: 0, top: 0, right: px(440), bottom: px(362) };
     let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE::default(), dpi);
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     let mut work = RECT::default();
@@ -400,6 +427,9 @@ unsafe fn apply(hwnd: HWND) -> bool {
     let prtsc = checked(hwnd, ID_PRTSC);
     let auto = checked(hwnd, ID_AUTOSAVE);
     let updates = checked(hwnd, ID_UPDATES);
+    let magnifier = checked(hwnd, ID_MAGNIFIER);
+    let pick = SendMessageW(item(hwnd, ID_SCALE), CB_GETCURSEL, None, None).0;
+    let scale = usize::try_from(pick).ok().and_then(|i| COPY_SCALES.get(i).copied());
     update(|c| {
         c.hotkey_mods = mods;
         c.hotkey_vk = vk;
@@ -407,6 +437,10 @@ unsafe fn apply(hwnd: HWND) -> bool {
         c.save_dir = dir;
         c.autosave = auto;
         c.check_updates = updates;
+        c.magnifier = magnifier;
+        if let Some(s) = scale {
+            c.copy_scale = s;
+        }
     });
     set_autostart(checked(hwnd, ID_STARTUP));
     crate::apply_hotkeys();
@@ -489,7 +523,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true, check_updates: false };
+        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true, check_updates: false, copy_scale: 150, magnifier: true };
         let back = parse(&format(&c));
         assert_eq!(format(&back), format(&c));
     }

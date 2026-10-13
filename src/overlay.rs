@@ -197,15 +197,28 @@ impl Drop for GdiShot {
     }
 }
 
-/// Starting the graphics driver is most of the time it takes to show the first Direct2D frame,
-/// so it starts on another thread, alongside grabbing the screen, while GDI draws meanwhile.
-/// The device is only kept until the window's own render target exists.
+/// Starting the graphics driver is most of the time it takes to show the first Direct2D frame
+/// (one to two seconds on some laptops), so a standby process does it before it's woken. A
+/// capture started without one starts it on another thread, alongside grabbing the screen,
+/// while GDI draws meanwhile. The device is only kept until the window's own render target exists.
 static WARM_DONE: AtomicBool = AtomicBool::new(false);
 static WARM_DEVICE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static OVERLAY_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Start the graphics driver now, on this thread.
+pub fn warm_gpu_now() {
+    warm();
+}
+
+/// Start the graphics driver on another thread, unless it already is.
 pub fn warm_gpu() {
-    std::thread::spawn(|| unsafe {
+    if !WARM_DONE.load(Ordering::Acquire) {
+        std::thread::spawn(warm);
+    }
+}
+
+fn warm() {
+    unsafe {
         let mut dev: Option<ID3D11Device> = None;
         let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         let _ = D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None);
@@ -217,7 +230,7 @@ pub fn warm_gpu() {
         if !hwnd.is_invalid() {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
-    });
+    }
 }
 
 fn release_warm_device() {
@@ -253,6 +266,8 @@ struct Overlay {
     typing_saved: bool,
     selected: Option<usize>,
     hot: Option<Btn>,
+    /// Show the magnifier without Shift held.
+    magnifier: bool,
 }
 
 thread_local! {
@@ -345,6 +360,7 @@ pub fn open(shot: Shot, full: bool) {
             typing_saved: false,
             selected: None,
             hot: None,
+            magnifier: cfg.magnifier,
         };
         if full {
             o.region = Some(o.monitor_at(mx, my).0);
@@ -375,6 +391,8 @@ fn close() {
         OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::Release);
         drop(o);
         release_warm_device();
+        // It's behind the editor, so going first can't flash anything.
+        crate::dim::close();
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
@@ -388,7 +406,9 @@ fn run(act: Act) {
         Act::Close => close(),
         Act::Copy => {
             let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) else { return };
-            if !gfx::copy_image(hwnd, &img) {
+            let pct = settings::get().copy_scale;
+            let scaled = if pct == 100 { None } else { gfx::scale_image(&img, pct) };
+            if !gfx::copy_image(hwnd, scaled.as_ref().unwrap_or(&img)) {
                 // Keep the editor open so the capture isn't lost.
                 crate::error_box(hwnd, "Could not copy to the clipboard. Another app may be using it; try again.");
                 return;
@@ -489,6 +509,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 a
             }
+        }
+        WM_KEYUP if wp.0 as u16 == VK_SHIFT.0 => {
+            with(|o| o.redraw());
+            Act::None
         }
         // Swallow Alt on its own so it does not enter menu mode on a window with no menu.
         WM_SYSKEYUP | WM_SYSCHAR => return LRESULT(0),
@@ -1074,6 +1098,12 @@ impl Overlay {
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
 
+        // Holding Shift shows the magnifier.
+        if vk == VK_SHIFT {
+            self.redraw();
+            return Act::None;
+        }
+
         if self.typing {
             match vk {
                 VK_ESCAPE => self.commit_text(),
@@ -1209,6 +1239,10 @@ impl Overlay {
         self.commit_text();
         let r = self.region?;
         let img = &self.shot.img;
+        if self.annots.is_empty() {
+            // Nothing drawn on it: just the pixels, without a round trip through Direct2D.
+            return Some(img.crop(r.l as u32, r.t as u32, r.w() as u32, r.h() as u32));
+        }
         let annots = &self.annots;
         gfx::render_image(r.w() as u32, r.h() as u32, |rt| unsafe {
             gfx::draw_tiles(rt, &gfx::tiles_of(rt, img, r.l as u32, r.t as u32, r.w() as u32, r.h() as u32));
@@ -1286,7 +1320,7 @@ impl Overlay {
                     let _ = BitBlt(hdc, l, t, r - l, b - t, Some(src), l, t, SRCCOPY);
                 }
             };
-            match self.live_region().or(self.hover) {
+            match self.live_region() {
                 Some(r) => {
                     blt(g.dim.0, 0, 0, w, r.t);
                     blt(g.dim.0, 0, r.b, w, h);
@@ -1318,7 +1352,9 @@ impl Overlay {
         let accent = brush(rt, ACCENT, 1.0);
         let white = brush(rt, 0xffffff, 1.0);
 
-        let lit = self.live_region().or(self.hover);
+        // Until something is selected the whole screen dims evenly. Lighting up the window
+        // under the mouse made the taskbar and the rest of the screen look highlighted apart.
+        let lit = self.live_region();
         match lit {
             Some(r) => {
                 let (l, t, rr, b) = (r.l as f32, r.t as f32, r.r as f32, r.b as f32);
@@ -1382,8 +1418,8 @@ impl Overlay {
 
         self.paint_bars(rt, s);
 
-        let magnify = self.region.is_none() || matches!(self.drag, Drag::NewRegion { .. } | Drag::Resize { .. });
-        if magnify {
+        let picking = self.region.is_none() || matches!(self.drag, Drag::NewRegion { .. } | Drag::Resize { .. });
+        if picking && (self.magnifier || key_down(VK_SHIFT)) {
             self.magnifier(rt, s);
         }
     }
@@ -1730,6 +1766,7 @@ mod tests {
             typing_saved: false,
             selected: None,
             hot: Some(Btn::Tool(Tool::Arrow)),
+            magnifier: true,
         };
         let mk = |t: Tool, c: u32, pts: Vec<[f32; 2]>, text: &str| Annot { tool: t, color: c, size: 6.0, fill: false, scale: 1.5, pts, text: text.into(), pixels: Default::default() };
         o.annots = vec![
@@ -1768,6 +1805,22 @@ mod tests {
         o.hover = Some(Rc { l: 300, t: 200, r: 1700, b: 1000 });
         o.hot = None;
         render(&mut o, "scene-pick");
+    }
+
+    /// Cropping gives the same pixels as drawing through Direct2D, and copies resize.
+    #[test]
+    fn crop_and_scale() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let (w, h) = (300u32, 200u32);
+        let px = (0..w * h * 4).map(|i| if i % 4 == 3 { 255 } else { (i * 7 % 251) as u8 }).collect();
+        let img = Image { w, h, px };
+        let crop = img.crop(40, 30, 120, 90);
+        let drawn = gfx::render_image(120, 90, |rt| gfx::draw_tiles(rt, &gfx::tiles_of(rt, &img, 40, 30, 120, 90))).unwrap();
+        assert_eq!(crop.px, drawn.px);
+        let big = gfx::scale_image(&crop, 150).unwrap();
+        assert_eq!((big.w, big.h, big.px.len()), (180, 135, 180 * 135 * 4));
     }
 
     /// An image wider than any GPU texture still comes out whole, via tiles.

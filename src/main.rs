@@ -6,6 +6,7 @@ mod annot;
 mod capture;
 mod countdown;
 mod dialogs;
+mod dim;
 mod gfx;
 mod overlay;
 mod pin;
@@ -231,7 +232,19 @@ fn capture_now(full: bool) {
 
 fn spawn_self(args: &[String]) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
-    std::process::Command::new(exe).args(args).spawn().is_ok()
+    let mut cmd = wide(&format!("\"{}\" {}", exe.display(), args.join(" ")));
+    // Without FORCEOFFFEEDBACK the pointer spins for seconds after starting a standby process,
+    // because Windows waits for it to show a window, which it doesn't.
+    let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, dwFlags: STARTF_FORCEOFFFEEDBACK, ..Default::default() };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        let ok = CreateProcessW(None, Some(windows::core::PWSTR(cmd.as_mut_ptr())), None, None, false, PROCESS_CREATION_FLAGS(0), None, None, &si, &mut pi).is_ok();
+        if ok {
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        ok
+    }
 }
 
 fn wake_standby(full: bool) -> bool {
@@ -261,6 +274,7 @@ fn standby_main(tray_pid: u32) {
         let Ok(tray) = OpenProcess(PROCESS_SYNCHRONIZE, false, tray_pid) else { return };
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         gfx::with(|_| ());
+        overlay::warm_gpu_now();
         let Ok(region) = CreateEventW(None, false, false, STANDBY_REGION) else { return };
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Another standby is already waiting.
@@ -268,7 +282,20 @@ fn standby_main(tray_pid: u32) {
             return;
         }
         let Ok(full) = CreateEventW(None, false, false, STANDBY_FULL) else { return };
-        let woke = WaitForMultipleObjects(&[region, full, tray], false, INFINITE);
+        dim::prepare();
+        // The dim window is a top-level window, so keep its messages moving while waiting.
+        let handles = [region, full, tray];
+        let woke = loop {
+            let w = MsgWaitForMultipleObjects(Some(&handles), false, INFINITE, QS_ALLINPUT);
+            if w.0 != WAIT_OBJECT_0.0 + handles.len() as u32 {
+                break w;
+            }
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        };
         // Gone from view at once, so the tray starts a new standby instead of waking this one.
         let _ = CloseHandle(region);
         let _ = CloseHandle(full);
@@ -304,10 +331,13 @@ fn run_capture(full: bool) {
             return;
         }
         let mut busy = Some(busy);
+        // Grey the screen out right away; the editor takes a few frames more to show.
+        dim::show();
         overlay::warm_gpu();
         settings::load();
-        if let Some(shot) = capture::grab_screen() {
-            overlay::open(shot, full);
+        match capture::grab_screen() {
+            Some(shot) => overlay::open(shot, full),
+            None => dim::close(),
         }
         // Checked before every wait rather than on a posted message: a dialog's own message
         // loop would swallow that message and leave the process running with nothing on screen.

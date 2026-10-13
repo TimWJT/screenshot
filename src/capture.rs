@@ -23,6 +23,16 @@ impl Image {
         let i = (y as usize * self.w as usize + x as usize) * 4;
         (self.px[i + 2] as u32) << 16 | (self.px[i + 1] as u32) << 8 | self.px[i] as u32
     }
+
+    /// The `w`×`h` block at (x, y), which must lie inside the image.
+    pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> Image {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for row in y..y + h {
+            let start = ((row * self.w + x) * 4) as usize;
+            px.extend_from_slice(&self.px[start..start + (w * 4) as usize]);
+        }
+        Image { w, h, px }
+    }
 }
 
 /// Everything on every monitor, plus where its top-left sits on the virtual desktop.
