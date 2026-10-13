@@ -1004,7 +1004,9 @@ impl Overlay {
                     }
                     *lx = x as f32;
                     *ly = y as f32;
-                    self.annots[i].translate(dx, dy);
+                    if let Some(a) = self.annots.get_mut(i) {
+                        a.translate(dx, dy);
+                    }
                 }
             }
         }
@@ -1025,7 +1027,13 @@ impl Overlay {
             }
             Drag::NewRegion { ax, ay } => {
                 let tiny = (x - ax).abs() < 4 && (y - ay).abs() < 4;
-                self.region = if tiny { self.hover } else { Rc::span(ax, ay, x, y).clip(&self.screen()) };
+                // The window under the click, not whatever was hovered before a region was picked.
+                self.region = if tiny {
+                    self.update_hover();
+                    self.hover
+                } else {
+                    Rc::span(ax, ay, x, y).clip(&self.screen())
+                };
                 if self.region.is_some_and(|r| r.w() < 2 || r.h() < 2) {
                     self.region = None;
                 }
@@ -1077,10 +1085,17 @@ impl Overlay {
         if matches!(self.drag, Drag::None) {
             return;
         }
-        if matches!(self.drag, Drag::Draw) {
-            self.current = None;
+        // Put back whatever the drag had moved.
+        match std::mem::replace(&mut self.drag, Drag::None) {
+            Drag::Draw => self.current = None,
+            Drag::MoveRegion { orig, .. } | Drag::Resize { orig, .. } => self.region = Some(orig),
+            Drag::MoveAnnot { moved: true, .. } => {
+                if let Some(before) = self.undo.pop() {
+                    self.annots = before;
+                }
+            }
+            _ => {}
         }
-        self.drag = Drag::None;
         self.redraw();
     }
 
@@ -1105,20 +1120,25 @@ impl Overlay {
         }
 
         if self.typing {
-            match vk {
-                VK_ESCAPE => self.commit_text(),
-                VK_RETURN if ctrl => self.commit_text(),
-                VK_V if ctrl => {
-                    if let Some(t) = gfx::paste_text(self.hwnd) {
-                        if let Some(a) = self.current.as_mut() {
-                            a.text.push_str(&t.replace("\r\n", "\n"));
+            if ctrl && matches!(vk, VK_C | VK_S | VK_P) {
+                // Copy, save and pin work mid-text too: finish the text, then go on below.
+                self.commit_text();
+            } else {
+                match vk {
+                    VK_ESCAPE => self.commit_text(),
+                    VK_RETURN if ctrl => self.commit_text(),
+                    VK_V if ctrl => {
+                        if let Some(t) = gfx::paste_text(self.hwnd) {
+                            if let Some(a) = self.current.as_mut() {
+                                a.text.push_str(&t.replace("\r\n", "\n"));
+                            }
                         }
                     }
+                    _ => return Act::None,
                 }
-                _ => return Act::None,
+                self.redraw();
+                return Act::None;
             }
-            self.redraw();
-            return Act::None;
         }
 
         if vk == VK_ESCAPE {
@@ -1126,6 +1146,11 @@ impl Overlay {
                 return self.on_right();
             }
             return Act::Close;
+        }
+
+        // Undo or delete mid-drag would leave the drag holding the wrong drawing, or none.
+        if !matches!(self.drag, Drag::None) && matches!(vk, VK_Z | VK_Y | VK_DELETE | VK_BACK) {
+            return Act::None;
         }
 
         let Some(r) = self.region else {

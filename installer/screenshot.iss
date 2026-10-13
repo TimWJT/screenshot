@@ -45,6 +45,8 @@ Name: "{group}\Uninstall Screenshot"; Filename: "{uninstallexe}"
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Screenshot"; ValueData: """{app}\screenshot.exe"" --tray"; Flags: uninsdeletevalue; Tasks: startup
 ; Settings can turn "start with Windows" on later, so remove the value on uninstall either way.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Screenshot"; Flags: uninsdeletevalue dontcreatekey
+; The app asks Windows for the power-saving graphics chip; forget that on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\DirectX\UserGpuPreferences"; ValueType: none; ValueName: "{app}\screenshot.exe"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
 Filename: "{app}\screenshot.exe"; Parameters: "--tray"; Description: "Start Screenshot now"; Flags: nowait postinstall skipifsilent

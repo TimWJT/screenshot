@@ -18,6 +18,8 @@ struct Pin {
     alpha: u8,
     /// Cursor offset inside the window while dragging.
     grab: Option<POINT>,
+    /// Scrolling not yet acted on: touchpads send many small steps per notch.
+    wheel: i32,
 }
 
 thread_local! {
@@ -26,9 +28,25 @@ thread_local! {
 
 pub const CLASS: PCWSTR = w!("TimWJT.Screenshot.Pin");
 const BORDER: i32 = 1;
+/// wParam bit for "left button down" in mouse messages.
+const MK_LBUTTON: usize = 0x0001;
 
 pub fn count() -> usize {
     PINS.with(|p| p.borrow().len())
+}
+
+/// Pins open in every capture process. Each capture runs in its own process, so `count`
+/// alone rarely sees more than one.
+fn count_all() -> usize {
+    let mut n = 0;
+    unsafe {
+        let mut after: Option<HWND> = None;
+        while let Ok(h) = FindWindowExW(None, after, CLASS, None) {
+            n += 1;
+            after = Some(h);
+        }
+    }
+    n
 }
 
 /// Is any pin open, in any capture process?
@@ -63,7 +81,7 @@ pub fn open(img: Image, x: i32, y: i32) {
             RegisterClassExW(&wc);
         });
         let (w, h) = (img.w as i32 + BORDER * 2, img.h as i32 + BORDER * 2);
-        let pin = Box::new(Pin { img, zoom: 1.0, alpha: 255, grab: None });
+        let pin = Box::new(Pin { img, zoom: 1.0, alpha: 255, grab: None, wheel: 0 });
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             CLASS,
@@ -199,7 +217,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if let Some(g) = pin(hwnd).and_then(|p| p.grab) {
+            if let Some(g) = pin(hwnd).and_then(|p| p.grab).filter(|_| wp.0 & MK_LBUTTON != 0) {
                 let mut c = POINT::default();
                 let _ = GetCursorPos(&mut c);
                 let _ = SetWindowPos(hwnd, None, c.x - g.x, c.y - g.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -213,6 +231,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = ReleaseCapture();
             LRESULT(0)
         }
+        // Lost the mouse mid-drag (a capture started, Alt+Tab): stop following it.
+        WM_CAPTURECHANGED => {
+            if let Some(p) = pin(hwnd) {
+                p.grab = None;
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDBLCLK => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -221,13 +246,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let delta = ((wp.0 >> 16) & 0xffff) as u16 as i16;
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             if let Some(p) = pin(hwnd) {
+                // One step per full notch (120), however finely the device reports it.
+                p.wheel += delta as i32;
+                let steps = p.wheel / WHEEL_DELTA as i32;
+                if steps == 0 {
+                    return LRESULT(0);
+                }
+                p.wheel -= steps * WHEEL_DELTA as i32;
                 if ctrl {
-                    let a = p.alpha as i32 + if delta > 0 { 25 } else { -25 };
+                    let a = p.alpha as i32 + steps * 25;
                     p.alpha = a.clamp(40, 255) as u8;
                     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), p.alpha, LWA_ALPHA);
                 } else {
-                    let f = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
-                    p.zoom = (p.zoom * f).clamp(0.1, 8.0);
+                    p.zoom = (p.zoom * 1.1f32.powi(steps)).clamp(0.1, 8.0);
                     if (p.zoom - 1.0).abs() < 0.04 {
                         p.zoom = 1.0;
                     }
@@ -260,7 +291,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             item(CMD_ZOOM, "Actual size\tCtrl+0");
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             item(CMD_CLOSE, "Close\tEsc");
-            if count() > 1 {
+            if count_all() > 1 {
                 item(CMD_CLOSE_ALL, "Close all pins");
             }
             let mut c = POINT::default();

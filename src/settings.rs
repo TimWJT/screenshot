@@ -68,6 +68,8 @@ impl Config {
 thread_local! {
     static CONFIG: RefCell<Config> = RefCell::new(Config::default());
     static WINDOW: RefCell<Option<SettingsWindow>> = const { RefCell::new(None) };
+    /// The control that had focus when Settings was last switched away from.
+    static LAST_FOCUS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
 fn file() -> PathBuf {
@@ -84,7 +86,8 @@ pub fn load() -> bool {
 
 fn parse(text: &str) -> Config {
     let mut c = Config::default();
-    for line in text.lines() {
+    // Notepad and others may start the file with a byte-order mark.
+    for line in text.trim_start_matches('\u{feff}').lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         let v = v.trim();
         let num = || v.parse::<u32>().ok();
@@ -203,6 +206,32 @@ pub fn set_autostart(on: bool) {
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
         }
+    }
+}
+
+// ---- graphics chip -----------------------------------------------------------------------
+
+const GPU_KEY: PCWSTR = w!("Software\\Microsoft\\DirectX\\UserGpuPreferences");
+
+/// Ask Windows to run this exe on the power-saving graphics chip. NVIDIA's driver sends any
+/// program called screenshot.exe to the dedicated GPU on laptops that have one, which then
+/// can't power down while a capture process waits, and takes a second or two to wake for each
+/// capture. A screenshot tool never needs the dedicated GPU, so this is set on every start.
+pub fn prefer_power_saving_gpu() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let name = wide(&exe.to_string_lossy());
+    unsafe {
+        // Keep any other per-app flags Windows stores in the same value.
+        let mut buf = [0u16; 512];
+        let mut size = (buf.len() * 2) as u32;
+        let old = if RegGetValueW(HKEY_CURRENT_USER, GPU_KEY, pcwstr(&name), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size)).is_ok() {
+            crate::util::from_wide(&buf)
+        } else {
+            String::new()
+        };
+        let rest: String = old.split(';').filter(|f| !f.is_empty() && !f.starts_with("GpuPreference=")).map(|f| format!("{f};")).collect();
+        let data = wide(&format!("GpuPreference=1;{rest}"));
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, GPU_KEY, pcwstr(&name), REG_SZ.0, Some(data.as_ptr() as *const _), (data.len() * 2) as u32);
     }
 }
 
@@ -496,9 +525,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // shortcut box, not start a capture.
         WM_ACTIVATE => {
             if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
+                // Remember which control had focus, so switching back returns to it.
+                let f = GetFocus();
+                if IsChild(hwnd, f).as_bool() {
+                    LAST_FOCUS.with(|l| l.set(f.0 as isize));
+                }
                 crate::apply_hotkeys();
             } else {
                 crate::suspend_hotkeys();
+                let f = HWND(LAST_FOCUS.with(|l| l.get()) as *mut _);
+                let f = if IsChild(hwnd, f).as_bool() { f } else { item(hwnd, ID_HOTKEY) };
+                let _ = SetFocus(Some(f));
             }
             LRESULT(0)
         }
@@ -534,6 +571,7 @@ mod tests {
         let d = Config::default();
         assert_eq!((c.hotkey_vk, c.color, c.size), (d.hotkey_vk, d.color, 40.0));
         assert_eq!(parse("").hotkey_mods, d.hotkey_mods);
+        assert_eq!(parse("\u{feff}hotkey_vk=65\r\n").hotkey_vk, 65, "a byte-order mark doesn't hide the first line");
     }
 
     #[test]

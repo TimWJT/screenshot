@@ -149,7 +149,7 @@ struct Args {
 
 fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Args {
     let mut a = Args::default();
-    let mut it = it.into_iter();
+    let mut it = it.into_iter().peekable();
     while let Some(s) = it.next() {
         match s.as_str() {
             "--tray" => a.tray_only = true,
@@ -158,7 +158,8 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Args {
             "--quit" => a.quit = true,
             "--full" => a.full = true,
             "--settings" => a.settings = true,
-            "--delay" => a.delay = it.next().and_then(|n| n.parse().ok()).unwrap_or(3),
+            // Only take the next word if it's a number, so "--delay --full" keeps --full.
+            "--delay" => a.delay = it.next_if(|n| n.parse::<u32>().is_ok()).and_then(|n| n.parse().ok()).unwrap_or(3),
             _ => {}
         }
     }
@@ -185,6 +186,9 @@ pub fn capture_after(full: bool, secs: u32, ms: u32) {
         countdown::start(secs, full);
         return;
     }
+    // Capturing now during a countdown: drop the countdown, and give the compositor a moment
+    // to take its bubble off screen so it isn't in the screenshot.
+    let ms = if countdown::cancel() { ms.max(120) } else { ms };
     if ms == 0 {
         capture_now(full);
     } else {
@@ -408,8 +412,12 @@ fn offer_update() {
         }
         return;
     }
-    if ask(&format!("{head}\n\nDownload and install it now? Screenshot closes while it updates, then starts again. Pinned screenshots will close.")) {
-        DOWNLOADING.with(|d| d.set(true));
+    // Set before asking: the balloon and the tray menu can both ask, and two yeses would start
+    // two downloads of the same file.
+    DOWNLOADING.with(|d| d.set(true));
+    if !ask(&format!("{head}\n\nDownload and install it now? Screenshot closes while it updates, then starts again. Pinned screenshots will close.")) {
+        DOWNLOADING.with(|d| d.set(false));
+    } else {
         tray_balloon("Downloading the update…", "Screenshot will restart when it's installed.");
         update::download(main_hwnd(), WM_UPDATE, rel);
     }
@@ -524,9 +532,23 @@ fn ensure_hook_thread() {
     }
     HOOK_THREAD.store(1, Ordering::Relaxed);
     std::thread::spawn(|| unsafe {
-        let _hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(hinstance()), 0);
+        let install = || SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(hinstance()), 0).ok();
+        let mut hook = install();
+        // Windows quietly removes a low-level hook that once answers too slowly (say, after the
+        // idle tray app was paged out), and the shortcut would stop working. So put it back
+        // every few minutes; the new one goes in first so no key slips past in between.
+        SetTimer(None, 0, 5 * 60 * 1000, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TIMER && msg.hwnd.is_invalid() {
+                let fresh = install();
+                if fresh.is_some() {
+                    if let Some(old) = std::mem::replace(&mut hook, fresh) {
+                        let _ = UnhookWindowsHookEx(old);
+                    }
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -609,7 +631,10 @@ fn add_tray() -> bool {
     unsafe {
         nid.hIcon = LoadIconMetric(Some(hinstance()), PCWSTR(1 as _), LIM_SMALL).unwrap_or_default();
         // An add that timed out may still have gone through, so a working modify counts too.
-        Shell_NotifyIconW(NIM_ADD, &nid).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
+        let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+        // The shell keeps its own copy.
+        let _ = DestroyIcon(nid.hIcon);
+        ok
     }
 }
 
@@ -647,6 +672,7 @@ fn tray_balloon(title: &str, text: &str) {
     unsafe {
         nid.hBalloonIcon = LoadIconMetric(Some(hinstance()), PCWSTR(1 as _), LIM_LARGE).unwrap_or_default();
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        let _ = DestroyIcon(nid.hBalloonIcon);
     }
 }
 
@@ -899,6 +925,7 @@ fn main() {
 
     add_tray_retrying();
     apply_hotkeys();
+    settings::prefer_power_saving_gpu();
     start_standby();
     // The first update check waits a minute, to stay out of the way while Windows starts up.
     unsafe {
@@ -943,6 +970,8 @@ mod tests {
         assert!(a.full && !a.capture && !a.quit && a.delay == 5);
         assert_eq!(args("--delay").delay, 3, "a bare --delay falls back to 3 seconds");
         assert_eq!(args("--delay soon").delay, 3);
+        let a = args("--delay --full");
+        assert!(a.full && a.delay == 3, "--delay doesn't swallow the next option");
         assert!(args("--tray --settings").settings);
         assert!(args("--quit").quit);
         assert!(args("--capture --full").capture);

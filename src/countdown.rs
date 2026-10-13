@@ -75,6 +75,16 @@ pub fn start(secs: u32, full: bool) {
     }
 }
 
+/// Stop a running countdown without capturing. False if none was running.
+pub fn cancel() -> bool {
+    let h = HWND_.with(|h| h.get());
+    if h == 0 {
+        return false;
+    }
+    unsafe { finish(HWND(h as *mut _), false) };
+    true
+}
+
 unsafe fn finish(hwnd: HWND, capture: bool) {
     let _ = KillTimer(Some(hwnd), TICK);
     let _ = DestroyWindow(hwnd);
