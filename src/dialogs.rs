@@ -41,30 +41,22 @@ pub fn save_as(owner: HWND, dir: &Path, name: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// `rgb` is 0xRRGGBB in and out.
-pub fn choose_color(owner: HWND, rgb: u32) -> Option<u32> {
-    thread_local! {
-        static CUSTOM: std::cell::RefCell<[COLORREF; 16]> = const { std::cell::RefCell::new([COLORREF(0xffffff); 16]) };
-    }
-    let to_ref = |c: u32| COLORREF(((c & 0xff) << 16) | (c & 0xff00) | ((c >> 16) & 0xff));
-    CUSTOM.with(|custom| {
-        let mut custom = custom.borrow_mut();
-        let mut cc = CHOOSECOLORW {
-            lStructSize: size_of::<CHOOSECOLORW>() as u32,
-            hwndOwner: owner,
-            rgbResult: to_ref(rgb),
-            lpCustColors: custom.as_mut_ptr(),
-            Flags: CC_RGBINIT | CC_FULLOPEN,
-            ..Default::default()
-        };
-        unsafe {
-            if !ChooseColorW(&mut cc).as_bool() {
-                return None;
-            }
-        }
-        let c = cc.rgbResult.0;
-        Some(((c & 0xff) << 16) | (c & 0xff00) | ((c >> 16) & 0xff))
-    })
+/// `rgb` and `custom` (the dialog's row of saved colours) are 0xRRGGBB in and out.
+pub fn choose_color(owner: HWND, rgb: u32, custom: &mut [u32; 16]) -> Option<u32> {
+    // 0xRRGGBB and COLORREF's 0x00BBGGRR are each other's byte swap.
+    let swap = |c: u32| ((c & 0xff) << 16) | (c & 0xff00) | ((c >> 16) & 0xff);
+    let mut refs = custom.map(|c| COLORREF(swap(c)));
+    let mut cc = CHOOSECOLORW {
+        lStructSize: size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: COLORREF(swap(rgb)),
+        lpCustColors: refs.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    let ok = unsafe { ChooseColorW(&mut cc).as_bool() };
+    *custom = refs.map(|c| swap(c.0));
+    ok.then(|| swap(cc.rgbResult.0))
 }
 
 pub fn pick_folder(owner: HWND, initial: &Path) -> Option<String> {

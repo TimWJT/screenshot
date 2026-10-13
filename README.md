@@ -45,9 +45,9 @@ Running `screenshot.exe` also starts a capture, and puts the app in the tray if 
 | **Adjust** | Drag the edges or handles to resize the selection, drag inside it to move it, or nudge it with the arrow keys. |
 | **Draw** | Rectangle, ellipse, arrow, line, pen, highlighter, text, numbered steps and pixelate. Eight colours plus a colour picker, three sizes (the mouse wheel fine-tunes), filled or outlined shapes. |
 | **Edit** | Move, recolour, resize or delete anything you drew with the select tool. Undo and redo everything. |
-| **Copy** | `Enter`, `Ctrl`+`C` or double-click. |
-| **Save** | `Ctrl`+`S` saves a PNG straight to `Pictures\Screenshots` and closes; click the notification to see it. `Ctrl`+`Shift`+`S` picks a name, folder, or JPEG. Optionally every copied screenshot is also saved there automatically. |
-| **Pin** | `Ctrl`+`P` leaves the screenshot floating on top of everything. Drag it around, scroll to zoom, `Ctrl`+scroll for transparency, double-click or `Esc` to close. |
+| **Copy** | `Enter`, `Ctrl`+`C` or double-click. A notification says it's on the clipboard. |
+| **Save** | `Ctrl`+`S` saves a PNG straight to `Pictures\Screenshots` and closes; click the notification to see it in its folder. `Ctrl`+`Shift`+`S` picks a name, folder, or JPEG. Optionally every copied screenshot is also saved there automatically. |
+| **Pin** | `Ctrl`+`P` leaves the screenshot floating on top of everything. Drag it around, scroll to zoom, `Ctrl`+scroll for transparency, double-click or `Esc` to close. Pins close when you exit the tray app. |
 | **Delay** | Tray menu → *Capture after a delay* gives a 3, 5 or 10 second countdown, for menus and tooltips that close when you press a key. |
 | **Pick a colour** | Before selecting, press `C` to copy the hex code of the pixel under the cursor. |
 | **Multi-monitor and high DPI** | Captures every monitor at full resolution. Toolbar and drawing sizes follow each monitor's scale. |
@@ -100,7 +100,7 @@ Right-click the tray icon → **Settings…**
 - **Also save every copied screenshot to this folder**
 - **Copied image size**: copies come out at their real pixel size by default; pick 50% to 200% to paste them smaller or larger. Saved files are always the real size.
 - **Always show the magnifier**: off by default; hold `Shift` while selecting to see it.
-- **Tell me when there's a new version**: on by default. Once a day the app checks GitHub for a newer release and shows a notification. Click it (or **Install update** in the tray menu) to download and install it; the app restarts on the new version. The portable exe opens the download page instead. Right-click the tray icon → **Check for updates** to check now.
+- **Tell me when there's a new version**: on by default. Once a day the app checks GitHub for a newer release and shows a notification. Click it (or **Install update** in the tray menu) to download and install it; the app restarts on the new version. The installer is checked against the checksum published with the release, and waits until any capture you're editing is closed. The portable exe opens the download page instead. Right-click the tray icon → **Check for updates** to check now.
 
 Settings are stored in `%APPDATA%\Screenshot\settings.ini`.
 

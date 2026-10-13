@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Networking::WinHttp::*;
+use windows::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::util::{from_wide, pcwstr, wide};
@@ -63,18 +64,48 @@ pub fn check(hwnd: HWND, msg: u32, manual: bool) {
 
 pub fn download(hwnd: HWND, msg: u32, rel: Release) {
     let h = hwnd.0 as isize;
-    std::thread::spawn(move || {
-        let result = (|| {
-            let r = get(&rel.setup_url(), true)?;
-            if r.status != 200 {
-                return Err(format!("GitHub has no installer for {} (HTTP {}).", rel.version, r.status));
-            }
-            let path = std::env::temp_dir().join(format!("Screenshot_{}_x64-setup.exe", rel.version));
-            std::fs::write(&path, r.body).map_err(|e| format!("Could not save the installer: {e}"))?;
-            Ok(path)
-        })();
-        finish(h, msg, Done::Downloaded(result));
-    });
+    std::thread::spawn(move || finish(h, msg, Done::Downloaded(fetch_installer(&rel))));
+}
+
+/// Download `rel`'s installer to the temp folder.
+fn fetch_installer(rel: &Release) -> Result<std::path::PathBuf, String> {
+    let r = get(&rel.setup_url(), true)?;
+    if r.status != 200 {
+        return Err(format!("GitHub has no installer for {} (HTTP {}).", rel.version, r.status));
+    }
+    // The release workflow publishes the installer's SHA-256 next to it; an installer that
+    // doesn't match it (cut short, or changed on the way) is never run.
+    let sum = get(&format!("{}.sha256", rel.setup_url()), true)?;
+    if sum.status != 200 {
+        return Err(format!("GitHub has no checksum for the {} installer (HTTP {}), so it can't be checked.", rel.version, sum.status));
+    }
+    if !matches_checksum(&r.body, &sum.body) {
+        return Err("The downloaded installer doesn't match its checksum, so it wasn't run. Try again later.".into());
+    }
+    let path = std::env::temp_dir().join(format!("Screenshot_{}_x64-setup.exe", rel.version));
+    std::fs::write(&path, r.body).map_err(|e| format!("Could not save the installer: {e}"))?;
+    Ok(path)
+}
+
+/// Does `data` hash to the SHA-256 at the start of `sum` ("<64 hex digits>  <file name>")?
+fn matches_checksum(data: &[u8], sum: &[u8]) -> bool {
+    let want = String::from_utf8_lossy(sum).split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let mut hash = [0u8; 32];
+    let ok = unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, data, &mut hash) }.is_ok();
+    let got: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    ok && want.len() == 64 && want == got
+}
+
+/// Delete installers that earlier updates downloaded. One can't delete itself while it runs,
+/// so each is cleared away by the next start of the app.
+pub fn clean_up() {
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("Screenshot_") && name.ends_with("_x64-setup.exe") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Is `latest` ("0.2.0") newer than `current`?
@@ -185,6 +216,15 @@ mod tests {
     }
 
     #[test]
+    fn checks_checksums() {
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(matches_checksum(b"abc", format!("{abc}  setup.exe\n").as_bytes()));
+        assert!(matches_checksum(b"abc", abc.to_uppercase().as_bytes()), "either case");
+        assert!(!matches_checksum(b"abd", abc.as_bytes()));
+        assert!(!matches_checksum(b"abc", b""), "no checksum is no match");
+    }
+
+    #[test]
     fn reads_release_redirect() {
         let r = release_from_url("https://github.com/TimWJT/screenshot/releases/tag/v0.2.0").unwrap();
         assert_eq!(r.version, "0.2.0");
@@ -205,5 +245,17 @@ mod tests {
         assert_eq!(setup.status, 200);
         assert!(setup.body.starts_with(b"MZ"), "not an exe");
         println!("installer: {} bytes", setup.body.len());
+        // Releases from before checksums were published must be refused, not run unchecked.
+        match fetch_installer(&rel) {
+            Ok(path) => {
+                assert!(std::fs::read(&path).unwrap().starts_with(b"MZ"));
+                let _ = std::fs::remove_file(path);
+                println!("checksum matched");
+            }
+            Err(e) => {
+                assert!(e.contains("no checksum"), "{e}");
+                println!("refused: {e}");
+            }
+        }
     }
 }

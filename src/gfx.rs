@@ -233,11 +233,14 @@ fn encode_image(img: &Image, path: &Path, out: &Path) -> Result<()> {
         (GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR)
     };
     let name = wide(&out.to_string_lossy());
-    with(|g| unsafe {
-        let src = g.wic.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGR, img.w * 4, &img.px)?;
-        let stream = g.wic.CreateStream()?;
+    // Its own imaging factory rather than `with`'s, so saving from a pin doesn't bring Direct2D
+    // into the tray app.
+    unsafe {
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let src = wic.CreateBitmapFromMemory(img.w, img.h, &GUID_WICPixelFormat32bppBGR, img.w * 4, &img.px)?;
+        let stream = wic.CreateStream()?;
         stream.InitializeFromFilename(crate::util::pcwstr(&name), GENERIC_WRITE.0)?;
-        let enc = g.wic.CreateEncoder(&container, std::ptr::null())?;
+        let enc = wic.CreateEncoder(&container, std::ptr::null())?;
         enc.Initialize(&stream, WICBitmapEncoderNoCache)?;
         let mut frame = None;
         let mut bag = None;
@@ -250,7 +253,7 @@ fn encode_image(img: &Image, path: &Path, out: &Path) -> Result<()> {
         frame.Commit()?;
         enc.Commit()?;
         Ok(())
-    })
+    }
 }
 
 /// `img` resized to `pct` percent, smoothly.

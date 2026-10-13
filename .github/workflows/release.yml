@@ -57,6 +57,10 @@ jobs:
             $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
           }
           iscc /DAppVersion=${{ steps.version.outputs.version }} installer\screenshot.iss
+          # The in-app updater refuses an installer that doesn't match this.
+          $setup = "Screenshot_${{ steps.version.outputs.version }}_x64-setup.exe"
+          $hash = (Get-FileHash "dist\$setup" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist\$setup.sha256" -Value "$hash  $setup" -NoNewline -Encoding ascii
           Copy-Item target\release\screenshot.exe "dist\Screenshot_${{ steps.version.outputs.version }}_x64-portable.exe"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

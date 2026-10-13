@@ -39,11 +39,15 @@ const TIMER_CAPTURE: usize = 1;
 const TIMER_TRAY: usize = 2;
 const TIMER_STANDBY: usize = 3;
 const TIMER_UPDATE: usize = 4;
+const TIMER_INSTALL: usize = 5;
 const STANDBY_REGION: PCWSTR = w!("Local\\TimWJT.Screenshot.Standby");
 const STANDBY_FULL: PCWSTR = w!("Local\\TimWJT.Screenshot.StandbyFull");
 const HK_MAIN: i32 = 1;
+const HK_PRTSC: i32 = 2;
 const COPYDATA_ARGS: usize = 0x5353;
 const COPYDATA_SAVED: usize = 0x5354;
+const COPYDATA_COPIED: usize = 0x5355;
+const COPYDATA_PIN: usize = 0x5356;
 
 const CMD_REGION: usize = 1;
 const CMD_FULL: usize = 2;
@@ -77,6 +81,8 @@ thread_local! {
     /// The version an automatic check last told the user about, so it only says so once.
     static UPDATE_TOLD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static DOWNLOADING: Cell<bool> = const { Cell::new(false) };
+    /// A downloaded installer, waiting for the capture being edited to finish.
+    static PENDING_INSTALL: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn main_hwnd() -> HWND {
@@ -105,13 +111,11 @@ pub fn save_to_folder(img: &Image) -> Result<std::path::PathBuf, String> {
 }
 
 /// When "also save every copied screenshot" is on, drop a PNG in the save folder.
-pub fn autosave(img: &Image) {
+pub fn autosave(img: &Image) -> Option<std::path::PathBuf> {
     if !settings::get().autosave {
-        return;
+        return None;
     }
-    if let Err(msg) = save_to_folder(img) {
-        error_box(HWND::default(), &msg);
-    }
+    save_to_folder(img).map_err(|msg| error_box(HWND::default(), &msg)).ok()
 }
 
 /// Have the tray app say where a screenshot was saved; clicking the notification opens it.
@@ -119,20 +123,53 @@ pub fn notify_saved(path: &std::path::Path) {
     send_to_tray(COPYDATA_SAVED, &path.to_string_lossy());
 }
 
+/// Have the tray app say a screenshot is on the clipboard, and where it was saved too, if it was.
+pub fn notify_copied(saved: Option<&std::path::Path>) {
+    send_to_tray(COPYDATA_COPIED, &saved.map(|p| p.to_string_lossy()).unwrap_or_default());
+}
+
 /// Pass `text` to the running tray app. False when it isn't running.
 fn send_to_tray(kind: usize, text: &str) -> bool {
+    let words: Vec<u16> = text.encode_utf16().collect();
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2) };
+    send_bytes_to_tray(kind, bytes)
+}
+
+/// Pass `bytes` to the running tray app. False when it isn't running or didn't take them.
+fn send_bytes_to_tray(kind: usize, bytes: &[u8]) -> bool {
     unsafe {
         let Ok(tray) = FindWindowW(MAIN_CLASS, None) else { return false };
-        // Let it come to the front if what it's asked to do opens a window (Settings).
+        // Let it come to the front if what it's asked to do opens a window (Settings, a pin).
         let mut pid = 0u32;
         GetWindowThreadProcessId(tray, Some(&mut pid));
         let _ = AllowSetForegroundWindow(pid);
-        let text: Vec<u16> = text.encode_utf16().collect();
-        let cds = COPYDATASTRUCT { dwData: kind, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+        let cds = COPYDATASTRUCT { dwData: kind, cbData: bytes.len() as u32, lpData: bytes.as_ptr() as *mut _ };
         // A timeout, so a busy or hung tray app can't freeze the caller.
-        let _ = SendMessageTimeoutW(tray, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 2000, None);
-        true
+        let mut answer = 0usize;
+        let sent = SendMessageTimeoutW(tray, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut answer));
+        sent.0 != 0 && answer == 1
     }
+}
+
+/// Pin `img` at (x, y) on screen. Pins live in the tray app, so this capture process (and the
+/// 100+ MB Direct2D holds on to) can exit; it only keeps the pin itself if the tray isn't there.
+pub fn pin_image(img: capture::Image, x: i32, y: i32) {
+    let mut msg = Vec::with_capacity(16 + img.px.len());
+    for v in [x, y, img.w as i32, img.h as i32] {
+        msg.extend_from_slice(&v.to_le_bytes());
+    }
+    msg.extend_from_slice(&img.px);
+    if !send_bytes_to_tray(COPYDATA_PIN, &msg) {
+        pin::open(img, x, y);
+    }
+}
+
+/// The image `pin_image` sent, and where it goes.
+fn read_pin(bytes: &[u8]) -> Option<(capture::Image, i32, i32)> {
+    let head: Vec<i32> = bytes.get(..16)?.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+    let (w, h) = (u32::try_from(head[2]).ok()?, u32::try_from(head[3]).ok()?);
+    let px = bytes.get(16..)?;
+    (w > 0 && h > 0 && px.len() as u64 == w as u64 * h as u64 * 4).then(|| (capture::Image { w, h, px: px.to_vec() }, head[0], head[1]))
 }
 
 #[derive(Default)]
@@ -387,7 +424,10 @@ fn update_done(done: update::Done) {
         update::Done::Checked { manual: true, result: Err(e) } => error_box(HWND::default(), &format!("Could not check for updates.\n\n{e}")),
         // Automatic checks stay quiet when offline.
         update::Done::Checked { .. } => {}
-        update::Done::Downloaded(Ok(path)) => run_installer(&path),
+        update::Done::Downloaded(Ok(path)) => {
+            PENDING_INSTALL.with(|p| *p.borrow_mut() = Some(path));
+            install_when_free();
+        }
         update::Done::Downloaded(Err(e)) => {
             DOWNLOADING.with(|d| d.set(false));
             error_box(HWND::default(), &format!("Could not download the update.\n\n{e}"));
@@ -425,6 +465,21 @@ fn offer_update() {
     } else {
         tray_balloon("Downloading the update…", "Screenshot will restart when it's installed.");
         update::download(main_hwnd(), WM_UPDATE, rel);
+    }
+}
+
+/// Run the downloaded installer, but not while a capture is being edited: the update closes
+/// it, and whatever was drawn on it would be lost. Checked again every second until it's closed.
+fn install_when_free() {
+    unsafe {
+        if FindWindowW(overlay::CLASS, None).is_ok() {
+            SetTimer(Some(main_hwnd()), TIMER_INSTALL, 1000, None);
+            return;
+        }
+        let _ = KillTimer(Some(main_hwnd()), TIMER_INSTALL);
+    }
+    if let Some(path) = PENDING_INSTALL.with(|p| p.borrow_mut().take()) {
+        run_installer(&path);
     }
 }
 
@@ -567,6 +622,7 @@ fn ensure_hook_thread() {
 pub fn suspend_hotkeys() {
     unsafe {
         let _ = UnregisterHotKey(Some(main_hwnd()), HK_MAIN);
+        let _ = UnregisterHotKey(Some(main_hwnd()), HK_PRTSC);
     }
     for slot in &HOOK_KEYS {
         slot.store(0, Ordering::Relaxed);
@@ -579,15 +635,20 @@ pub fn apply_hotkeys() {
     let mut hooked = Vec::new();
     unsafe {
         let _ = UnregisterHotKey(Some(hwnd), HK_MAIN);
+        let _ = UnregisterHotKey(Some(hwnd), HK_PRTSC);
         if cfg.hotkey_vk != 0 {
             let mods = HOT_KEY_MODIFIERS(cfg.hotkey_mods) | MOD_NOREPEAT;
             if RegisterHotKey(Some(hwnd), HK_MAIN, mods, cfg.hotkey_vk).is_err() {
                 hooked.push(((cfg.hotkey_mods as u64) << 32) | cfg.hotkey_vk as u64);
             }
         }
-    }
-    if cfg.printscreen {
-        hooked.push(VK_SNAPSHOT.0 as u64);
+        if cfg.printscreen {
+            hooked.push(VK_SNAPSHOT.0 as u64);
+            // The hook doesn't see keys pressed while a program running as administrator is
+            // in front, so register the key too where Windows allows it. A key the hook
+            // swallows never reaches this, so one press can't start two captures.
+            let _ = RegisterHotKey(Some(hwnd), HK_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32);
+        }
     }
     for (i, slot) in HOOK_KEYS.iter().enumerate() {
         slot.store(hooked.get(i).copied().unwrap_or(0), Ordering::Relaxed);
@@ -676,11 +737,55 @@ fn tray_balloon(title: &str, text: &str) {
     for (d, s) in nid.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
         *d = s;
     }
+    nid.hBalloonIcon = balloon_icon();
     unsafe {
-        nid.hBalloonIcon = LoadIconMetric(Some(hinstance()), PCWSTR(1 as _), LIM_LARGE).unwrap_or_default();
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        let _ = DestroyIcon(nid.hBalloonIcon);
     }
+}
+
+/// The notifications' icon, loaded once and never destroyed: Windows draws the notification
+/// after Shell_NotifyIcon returns, and drops it without a word if the icon is gone by then.
+fn balloon_icon() -> HICON {
+    thread_local! {
+        static ICON: Cell<isize> = const { Cell::new(0) };
+    }
+    ICON.with(|i| {
+        if i.get() == 0 {
+            let icon = unsafe { LoadIconMetric(Some(hinstance()), PCWSTR(1 as _), LIM_LARGE) };
+            i.set(icon.unwrap_or_default().0 as isize);
+        }
+        HICON(i.get() as *mut _)
+    })
+}
+
+/// Open Explorer on the file's folder with the file selected, or just the folder if the file
+/// has gone since. Through the shell rather than an explorer.exe command line, so nothing in the
+/// path can be read as an option.
+fn show_in_folder(path: &str) {
+    let p = wide(path);
+    unsafe {
+        let item = ILCreateFromPathW(pcwstr(&p));
+        if !item.is_null() {
+            let _ = SHOpenFolderAndSelectItems(item, None, 0);
+            ILFree(Some(item));
+            return;
+        }
+    }
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| d.is_dir()) {
+        let d = wide(&dir.to_string_lossy());
+        unsafe {
+            ShellExecuteW(None, w!("open"), pcwstr(&d), None, None, SW_SHOWNORMAL);
+        }
+    }
+}
+
+/// A notification about a file that was saved; clicking it shows the file in its folder.
+fn saved_balloon(title: &str, path: String) {
+    let p = std::path::Path::new(&path);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = p.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    tray_balloon(title, &format!("{name}\nin {folder}\nClick to show it."));
+    LAST_SAVED.with(|s| *s.borrow_mut() = Some(path));
 }
 
 fn remove_tray() {
@@ -769,8 +874,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                     // A "Screenshot saved" notification: show the file in its folder.
                     else if let Some(path) = LAST_SAVED.with(|s| s.borrow_mut().take()) {
-                        let params = wide(&format!("/select,\"{path}\""));
-                        ShellExecuteW(None, w!("open"), w!("explorer.exe"), pcwstr(&params), None, SW_SHOWNORMAL);
+                        show_in_folder(&path);
                     }
                 }
                 _ => {}
@@ -796,6 +900,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             SetTimer(Some(hwnd), TIMER_UPDATE, 24 * 60 * 60 * 1000, None);
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIMER_INSTALL => {
+            install_when_free();
+            LRESULT(0)
+        }
         WM_UPDATE => {
             for done in update::take() {
                 update_done(done);
@@ -814,27 +922,28 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_COPYDATA => {
             let cds = &*(lp.0 as *const COPYDATASTRUCT);
-            if cds.lpData.is_null() {
-                return LRESULT(1);
-            }
-            let words = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
-            let text = String::from_utf16_lossy(words);
+            // Empty data (a copy that wasn't saved) can arrive with no buffer at all.
+            let bytes: &[u8] = if cds.lpData.is_null() { &[] } else { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+            let text = || {
+                let words: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+                String::from_utf16_lossy(&words)
+            };
             match cds.dwData {
                 COPYDATA_ARGS => {
-                    let args = parse_args(text.split('\n').filter(|s| !s.is_empty()).map(String::from));
+                    let args = parse_args(text().split('\n').filter(|s| !s.is_empty()).map(String::from));
                     if args.tray_only && !args.settings {
                         tray_balloon("Screenshot is already running", "It lives in the tray, by the clock.");
                     } else {
                         run_args(&args);
                     }
                 }
-                COPYDATA_SAVED => {
-                    let path = std::path::Path::new(&text);
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-                    tray_balloon("Screenshot saved", &format!("{name}\nin {folder}\nClick to show it."));
-                    LAST_SAVED.with(|s| *s.borrow_mut() = Some(text));
-                }
+                COPYDATA_SAVED => saved_balloon("Screenshot saved", text()),
+                COPYDATA_COPIED if bytes.is_empty() => tray_balloon("Screenshot copied", "Paste it anywhere with Ctrl+V."),
+                COPYDATA_COPIED => saved_balloon("Screenshot copied and saved", text()),
+                COPYDATA_PIN => match read_pin(bytes) {
+                    Some((img, x, y)) => pin::open(img, x, y),
+                    None => return LRESULT(0),
+                },
                 _ => {}
             }
             LRESULT(1)
@@ -935,6 +1044,8 @@ fn main() {
     apply_hotkeys();
     settings::prefer_power_saving_gpu();
     start_standby();
+    // Off this thread: the temp folder can hold thousands of files.
+    std::thread::spawn(update::clean_up);
     // The first update check waits a minute, to stay out of the way while Windows starts up.
     unsafe {
         SetTimer(Some(main_hwnd()), TIMER_UPDATE, 60 * 1000, None);

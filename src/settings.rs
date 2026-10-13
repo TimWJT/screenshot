@@ -32,6 +32,8 @@ pub struct Config {
     pub copy_scale: u32,
     /// Show the magnifier while selecting without holding Shift.
     pub magnifier: bool,
+    /// The colour dialog's row of saved custom colours, 0xRRGGBB.
+    pub custom_colors: [u32; 16],
 }
 
 /// The choices for `copy_scale`.
@@ -51,6 +53,7 @@ impl Default for Config {
             check_updates: true,
             copy_scale: 100,
             magnifier: false,
+            custom_colors: [0xffffff; 16],
         }
     }
 }
@@ -104,6 +107,11 @@ fn parse(text: &str) -> Config {
             "check_updates" => c.check_updates = flag,
             "copy_scale" => c.copy_scale = num().filter(|n| COPY_SCALES.contains(n)).unwrap_or(c.copy_scale),
             "magnifier" => c.magnifier = flag,
+            "custom_colors" => {
+                for (slot, hex) in c.custom_colors.iter_mut().zip(v.split(',')) {
+                    *slot = u32::from_str_radix(hex.trim().trim_start_matches('#'), 16).ok().filter(|&n| n <= 0xffffff).unwrap_or(*slot);
+                }
+            }
             _ => {}
         }
     }
@@ -112,7 +120,7 @@ fn parse(text: &str) -> Config {
 
 fn format(c: &Config) -> String {
     format!(
-        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\ncheck_updates={}\ncopy_scale={}\nmagnifier={}\n",
+        "hotkey_mods={}\nhotkey_vk={}\nprintscreen={}\nsave_dir={}\nautosave={}\ncolor=#{:06X}\nsize={}\nfill={}\ncheck_updates={}\ncopy_scale={}\nmagnifier={}\ncustom_colors={}\n",
         c.hotkey_mods,
         c.hotkey_vk,
         c.printscreen as u8,
@@ -123,7 +131,8 @@ fn format(c: &Config) -> String {
         c.fill as u8,
         c.check_updates as u8,
         c.copy_scale,
-        c.magnifier as u8
+        c.magnifier as u8,
+        c.custom_colors.iter().map(|c| format!("#{c:06X}")).collect::<Vec<_>>().join(",")
     )
 }
 
@@ -592,7 +601,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true, check_updates: false, copy_scale: 150, magnifier: true };
+        let c = Config { hotkey_mods: MOD_CONTROL.0 | MOD_SHIFT.0, hotkey_vk: 0x53, printscreen: false, save_dir: r"D:\Shots = mine".into(), autosave: true, color: 0x00ff7f, size: 7.0, fill: true, check_updates: false, copy_scale: 150, magnifier: true, custom_colors: [0x123456; 16] };
         let back = parse(&format(&c));
         assert_eq!(format(&back), format(&c));
     }
@@ -603,6 +612,8 @@ mod tests {
         let d = Config::default();
         assert_eq!((c.hotkey_vk, c.color, c.size), (d.hotkey_vk, d.color, 40.0));
         assert_eq!(parse("").hotkey_mods, d.hotkey_mods);
+        let partial = parse("custom_colors=#ff0000,zz,#00ff00\n").custom_colors;
+        assert_eq!(partial[..4], [0xff0000, 0xffffff, 0x00ff00, 0xffffff], "bad or missing colours keep their default");
         assert_eq!(parse("\u{feff}hotkey_vk=65\r\n").hotkey_vk, 65, "a byte-order mark doesn't hide the first line");
     }
 

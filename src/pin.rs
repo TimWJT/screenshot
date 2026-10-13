@@ -139,7 +139,11 @@ unsafe fn command(hwnd: HWND, cmd: usize) {
     let Some(p) = pin(hwnd) else { return };
     match cmd {
         CMD_COPY => {
-            gfx::copy_image(hwnd, &p.img);
+            if gfx::copy_image(hwnd, &p.img) {
+                crate::notify_copied(None);
+            } else {
+                crate::error_box(hwnd, "Could not copy to the clipboard. Another app may be using it; try again.");
+            }
         }
         CMD_SAVE => match crate::save_to_folder(&p.img) {
             Ok(path) => crate::notify_saved(&path),
@@ -148,8 +152,9 @@ unsafe fn command(hwnd: HWND, cmd: usize) {
         CMD_SAVE_AS => {
             let img = p.img.clone();
             if let Some(path) = dialogs::save_as(hwnd, &settings::get().save_path(), &timestamp_name()) {
-                if let Err(e) = gfx::save_image(&img, &path) {
-                    crate::error_box(hwnd, &format!("Could not save {}\n\n{e}", path.display()));
+                match gfx::save_image(&img, &path) {
+                    Ok(()) => crate::notify_saved(&path),
+                    Err(e) => crate::error_box(hwnd, &format!("Could not save {}\n\n{e}", path.display())),
                 }
             }
         }

@@ -18,7 +18,7 @@ use crate::annot::{contrast, Annot, Tool};
 use crate::capture::{self, Image, Shot};
 use crate::gfx::{self, affine, brush, rf, v2};
 use crate::util::{hinstance, x_lparam, y_lparam};
-use crate::{dialogs, pin, settings};
+use crate::{dialogs, settings};
 
 pub const ACCENT: u32 = 0x2f80ed;
 const PALETTE: [(u32, &str); 8] = [
@@ -284,6 +284,8 @@ struct Overlay {
     hot: Option<Btn>,
     /// Show the magnifier without Shift held.
     magnifier: bool,
+    /// Scrolling not yet acted on: touchpads send many small steps per notch.
+    wheel: i32,
 }
 
 thread_local! {
@@ -377,6 +379,7 @@ pub fn open(shot: Shot, full: bool) {
             selected: None,
             hot: None,
             magnifier: cfg.magnifier,
+            wheel: 0,
         };
         if full {
             o.region = Some(o.monitor_at(mx, my).0);
@@ -398,11 +401,14 @@ pub fn open(shot: Shot, full: bool) {
 fn close() {
     let taken = OVERLAY.with(|o| o.try_borrow_mut().ok().and_then(|mut o| o.take()));
     if let Some(o) = taken {
-        settings::update(|c| {
-            c.color = o.color;
-            c.size = o.size;
-            c.fill = o.fill;
-        });
+        let cfg = settings::get();
+        if (cfg.color, cfg.size, cfg.fill) != (o.color, o.size, o.fill) {
+            settings::update(|c| {
+                c.color = o.color;
+                c.size = o.size;
+                c.fill = o.fill;
+            });
+        }
         let hwnd = o.hwnd;
         OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::Release);
         drop(o);
@@ -431,7 +437,8 @@ fn run(act: Act) {
             }
             close();
             // After closing, so a "could not save" message isn't hidden behind the editor.
-            crate::autosave(&img);
+            let saved = crate::autosave(&img);
+            crate::notify_copied(saved.as_deref());
         }
         Act::Save => {
             let Some((hwnd, img)) = with(|o| o.export().map(|i| (o.hwnd, i))) else { return };
@@ -453,6 +460,7 @@ fn run(act: Act) {
                     return;
                 }
                 close();
+                crate::notify_saved(&path);
             }
         }
         Act::Pin => {
@@ -463,11 +471,17 @@ fn run(act: Act) {
                 return;
             };
             close();
-            pin::open(img, x, y);
+            crate::pin_image(img, x, y);
         }
         Act::PickColor => {
             let Some((hwnd, color)) = with(|o| Some((o.hwnd, o.color))) else { return };
-            if let Some(c) = dialogs::choose_color(hwnd, color) {
+            let mut custom = settings::get().custom_colors;
+            let picked = dialogs::choose_color(hwnd, color, &mut custom);
+            // The dialog's own custom colours are kept even if it was cancelled, as Windows does.
+            if custom != settings::get().custom_colors {
+                settings::update(|c| c.custom_colors = custom);
+            }
+            if let Some(c) = picked {
                 with(|o| {
                     o.color = c;
                     o.recolor_selected();
@@ -1141,8 +1155,14 @@ impl Overlay {
         if self.region.is_none() || self.tool == Tool::Select {
             return;
         }
-        let step = if delta > 0 { 1.0 } else { -1.0 };
-        self.size = (self.size + step).clamp(1.0, 40.0);
+        // One step per full notch (120), however finely the device reports it.
+        self.wheel += delta as i32;
+        let steps = self.wheel / WHEEL_DELTA as i32;
+        if steps == 0 {
+            return;
+        }
+        self.wheel -= steps * WHEEL_DELTA as i32;
+        self.size = (self.size + steps as f32).clamp(1.0, 40.0);
         self.resize_selected();
         self.redraw();
     }
@@ -1830,6 +1850,7 @@ mod tests {
             selected: None,
             hot: Some(Btn::Tool(Tool::Arrow)),
             magnifier: true,
+            wheel: 0,
         };
         let mk = |t: Tool, c: u32, pts: Vec<[f32; 2]>, text: &str| Annot { tool: t, color: c, size: 6.0, fill: false, scale: 1.5, pts, text: text.into(), pixels: Default::default() };
         o.annots = vec![
