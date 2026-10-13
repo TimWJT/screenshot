@@ -48,6 +48,7 @@ const COPYDATA_ARGS: usize = 0x5353;
 const COPYDATA_SAVED: usize = 0x5354;
 const COPYDATA_COPIED: usize = 0x5355;
 const COPYDATA_PIN: usize = 0x5356;
+const COPYDATA_COLOR: usize = 0x5357;
 
 const CMD_REGION: usize = 1;
 const CMD_FULL: usize = 2;
@@ -126,6 +127,11 @@ pub fn notify_saved(path: &std::path::Path) {
 /// Have the tray app say a screenshot is on the clipboard, and where it was saved too, if it was.
 pub fn notify_copied(saved: Option<&std::path::Path>) {
     send_to_tray(COPYDATA_COPIED, &saved.map(|p| p.to_string_lossy()).unwrap_or_default());
+}
+
+/// Have the tray app say a colour's hex code is on the clipboard.
+pub fn notify_color(hex: &str) {
+    send_to_tray(COPYDATA_COLOR, hex);
 }
 
 /// Pass `text` to the running tray app. False when it isn't running.
@@ -940,6 +946,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 COPYDATA_SAVED => saved_balloon("Screenshot saved", text()),
                 COPYDATA_COPIED if bytes.is_empty() => tray_balloon("Screenshot copied", "Paste it anywhere with Ctrl+V."),
                 COPYDATA_COPIED => saved_balloon("Screenshot copied and saved", text()),
+                COPYDATA_COLOR => tray_balloon(&format!("Copied {}", text()), "Paste the colour code anywhere with Ctrl+V."),
                 COPYDATA_PIN => match read_pin(bytes) {
                     Some((img, x, y)) => pin::open(img, x, y),
                     None => return LRESULT(0),

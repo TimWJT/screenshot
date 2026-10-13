@@ -40,8 +40,8 @@ Running `screenshot.exe` also starts a capture, and puts the app in the tray if 
 
 | | |
 |---|---|
-| **Region, window or full screen** | Drag a box, click a window to grab all of it, or press `F` for the whole monitor and `Ctrl`+`A` for every monitor. |
-| **Magnifier** | Hold `Shift` while selecting for a zoomed view of the pixels under the cursor, with coordinates and the colour's hex code. Arrow keys move the cursor one pixel at a time. Settings can keep it on all the time. |
+| **Region, window or full screen** | Drag a box, click a window to grab all of it, or press `F` for the whole monitor. `Ctrl`+`A` selects the monitor without the taskbar; press it again to include the taskbar, and again to go back. |
+| **Magnifier** | Hold `Shift`, before or after selecting, for a zoomed view of the pixels under the cursor, with coordinates and the colour's hex code. Arrow keys move the cursor one pixel at a time. Settings can keep it on all the time. |
 | **Adjust** | Drag the edges or handles to resize the selection, drag inside it to move it, or nudge it with the arrow keys. |
 | **Draw** | Rectangle, ellipse, arrow, line, pen, highlighter, text, numbered steps and pixelate. Eight colours plus a colour picker, three sizes (the mouse wheel fine-tunes), filled or outlined shapes. |
 | **Edit** | Move, recolour, resize or delete anything you drew with the select tool. Undo and redo everything. |
@@ -49,7 +49,7 @@ Running `screenshot.exe` also starts a capture, and puts the app in the tray if 
 | **Save** | `Ctrl`+`S` saves a PNG straight to `Pictures\Screenshots` and closes; click the notification to see it in its folder. `Ctrl`+`Shift`+`S` picks a name, folder, or JPEG. Optionally every copied screenshot is also saved there automatically. |
 | **Pin** | `Ctrl`+`P` leaves the screenshot floating on top of everything. Drag it around, scroll to zoom, `Ctrl`+scroll for transparency, double-click or `Esc` to close. Pins close when you exit the tray app. |
 | **Delay** | Tray menu → *Capture after a delay* gives a 3, 5 or 10 second countdown, for menus and tooltips that close when you press a key. |
-| **Pick a colour** | Before selecting, press `C` to copy the hex code of the pixel under the cursor. |
+| **Pick a colour** | Press `C` to copy the hex code of the pixel under the cursor. Before selecting, this also closes the screenshot; after, the editor stays open. |
 | **Multi-monitor and high DPI** | Captures every monitor at full resolution. Toolbar and drawing sizes follow each monitor's scale. |
 
 ## Keyboard
@@ -60,7 +60,7 @@ While selecting:
 |---|---|
 | `Enter` / `Space` | Select the window under the mouse |
 | `F` | Select the whole monitor |
-| `Ctrl`+`A` | Select every monitor |
+| `Ctrl`+`A` | Select the monitor without the taskbar; again to include it |
 | `C` | Copy the colour under the cursor |
 | hold `Shift` | Show the magnifier |
 | Arrow keys | Move the cursor 1 px (`Shift`: 10 px) |
@@ -99,7 +99,7 @@ Right-click the tray icon → **Settings…**
 - **Save folder**: where `Ctrl`+`S` saves. Defaults to `Pictures\Screenshots` (created if missing; if OneDrive backs up your Pictures, that's the OneDrive one).
 - **Also save every copied screenshot to this folder**
 - **Copied image size**: copies come out at their real pixel size by default; pick 50% to 200% to paste them smaller or larger. Saved files are always the real size.
-- **Always show the magnifier**: off by default; hold `Shift` while selecting to see it.
+- **Always show the magnifier**: off by default; hold `Shift` to see it.
 - **Tell me when there's a new version**: on by default. Once a day the app checks GitHub for a newer release and shows a notification. Click it (or **Install update** in the tray menu) to download and install it; the app restarts on the new version. The installer is checked against the checksum published with the release, and waits until any capture you're editing is closed. The portable exe opens the download page instead. Right-click the tray icon → **Check for updates** to check now.
 
 Settings are stored in `%APPDATA%\Screenshot\settings.ini`.

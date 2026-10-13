@@ -135,7 +135,8 @@ enum Act {
     Pin,
     Close,
     PickColor,
-    CopyColor(u32),
+    /// Copy a pixel's hex code; close too when no region is picked yet.
+    CopyColor(u32, bool),
 }
 
 enum Item {
@@ -489,11 +490,17 @@ fn run(act: Act) {
                 });
             }
         }
-        Act::CopyColor(rgb) => {
-            if let Some(hwnd) = with(|o| Some(o.hwnd)) {
-                gfx::copy_text(hwnd, &format!("#{rgb:06X}"));
+        Act::CopyColor(rgb, done) => {
+            let Some(hwnd) = with(|o| Some(o.hwnd)) else { return };
+            let hex = format!("#{rgb:06X}");
+            if !gfx::copy_text(hwnd, &hex) {
+                crate::error_box(hwnd, "Could not copy to the clipboard. Another app may be using it; try again.");
+                return;
             }
-            close();
+            if done {
+                close();
+            }
+            crate::notify_color(&hex);
         }
     }
 }
@@ -605,6 +612,17 @@ impl Overlay {
             dx as i64 * dx as i64 + dy as i64 * dy as i64
         };
         self.mons.iter().min_by_key(|m| dist(&m.0)).copied().unwrap_or((self.screen(), 1.0))
+    }
+
+    /// Ctrl+A: the monitor under the cursor without the taskbar, then with it, and back again.
+    fn select_all(&mut self) {
+        let (mon, _) = self.monitor_at(self.mx, self.my);
+        let Some(mon) = mon.clip(&self.screen()) else { return };
+        let (ox, oy) = (self.shot.x, self.shot.y);
+        let work = capture::work_area(RECT { left: mon.l + ox, top: mon.t + oy, right: mon.r + ox, bottom: mon.b + oy })
+            .and_then(|w| Rc { l: w.left - ox, t: w.top - oy, r: w.right - ox, b: w.bottom - oy }.clip(&mon))
+            .unwrap_or(mon);
+        self.region = Some(if self.region == Some(work) { mon } else { work });
     }
 
     fn update_hover(&mut self) {
@@ -1218,8 +1236,8 @@ impl Overlay {
                     self.region = self.hover;
                 }
                 VK_F => self.region = Some(self.monitor_at(self.mx, self.my).0),
-                VK_A if ctrl => self.region = Some(self.screen()),
-                VK_C => return Act::CopyColor(self.shot.img.pixel(self.mx, self.my)),
+                VK_A if ctrl => self.select_all(),
+                VK_C => return Act::CopyColor(self.shot.img.pixel(self.mx, self.my), true),
                 VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => nudge_cursor(vk, if shift { 10 } else { 1 }),
                 _ => {}
             }
@@ -1236,7 +1254,7 @@ impl Overlay {
                 VK_Z if shift => self.redo(),
                 VK_Z => self.undo(),
                 VK_Y => self.redo(),
-                VK_A => self.region = Some(self.screen()),
+                VK_A => self.select_all(),
                 _ => return Act::None,
             }
             self.redraw();
@@ -1245,6 +1263,7 @@ impl Overlay {
 
         match vk {
             VK_RETURN => return Act::Copy,
+            VK_C => return Act::CopyColor(self.shot.img.pixel(self.mx, self.my), false),
             VK_DELETE | VK_BACK => {
                 if let Some(i) = self.selected.take() {
                     self.save_undo();
@@ -1502,7 +1521,9 @@ impl Overlay {
         self.paint_bars(rt, s);
 
         let picking = self.region.is_none() || matches!(self.drag, Drag::NewRegion { .. } | Drag::Resize { .. });
-        if picking && (self.magnifier || key_down(VK_SHIFT)) {
+        // Shift also squares shapes, snaps lines and types capitals: no magnifier in the way then.
+        let shift = key_down(VK_SHIFT) && !self.typing && !matches!(self.drag, Drag::Draw | Drag::MoveAnnot { .. });
+        if (picking && self.magnifier) || shift {
             self.magnifier(rt, s);
         }
     }

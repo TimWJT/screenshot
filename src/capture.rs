@@ -145,3 +145,12 @@ pub fn monitors() -> Vec<(RECT, f32)> {
     }
     out
 }
+
+/// The part of the monitor at `r` not covered by the taskbar, in screen coordinates.
+pub fn work_area(r: RECT) -> Option<RECT> {
+    unsafe {
+        let mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+    }
+}
